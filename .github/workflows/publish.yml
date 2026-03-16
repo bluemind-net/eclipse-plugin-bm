@@ -26,6 +26,9 @@ jobs:
       - name: Build with Tycho
         run: mvn -B -ntp -nsu clean verify
 
+      - name: Prepare Pages content
+        run: cp net.bluemind.devtools.testrunner.site/index.html net.bluemind.devtools.testrunner.site/target/repository/
+
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v4
         with:
