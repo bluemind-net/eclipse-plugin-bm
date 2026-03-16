@@ -79,6 +79,7 @@ public class BmTestLaunchShortcut implements ILaunchShortcut2 {
 
 	private ILaunchConfiguration findOrCreateConfig(IProject project) throws CoreException {
 		BundleInfo info = readBundleInfo(project);
+		String projectName = project.getName();
 
 		ILaunchManager manager = DebugPlugin.getDefault().getLaunchManager();
 		ILaunchConfigurationType type = manager.getLaunchConfigurationType(LAUNCH_CONFIG_TYPE);
@@ -89,14 +90,14 @@ public class BmTestLaunchShortcut implements ILaunchShortcut2 {
 		}
 
 		for (ILaunchConfiguration existing : manager.getLaunchConfigurations(type)) {
-			if (existing.getName().equals(info.symbolicName)) {
-				LOG.info("Reusing launch configuration: " + info.symbolicName);
+			if (existing.getName().equals(projectName)) {
+				LOG.info("Reusing launch configuration: " + projectName);
 				return existing;
 			}
 		}
 
-		LOG.info("Creating launch configuration: " + info.symbolicName);
-		ILaunchConfigurationWorkingCopy wc = type.newInstance(null, info.symbolicName);
+		LOG.info("Creating launch configuration: " + projectName);
+		ILaunchConfigurationWorkingCopy wc = type.newInstance(null, projectName);
 
 		String additionalPlugin = info.fragmentHost != null
 				? info.fragmentHost + ":" + info.version + ":default:true:default:default"
@@ -117,8 +118,8 @@ public class BmTestLaunchShortcut implements ILaunchShortcut2 {
 		wc.setAttribute("checked", "[NONE]");
 
 		// Main tab
-		wc.setAttribute("org.eclipse.jdt.launching.PROJECT_ATTR", info.symbolicName);
-		wc.setAttribute("org.eclipse.jdt.junit.CONTAINER", "=" + info.symbolicName);
+		wc.setAttribute("org.eclipse.jdt.launching.PROJECT_ATTR", projectName);
+		wc.setAttribute("org.eclipse.jdt.junit.CONTAINER", "=" + projectName);
 		wc.setAttribute("org.eclipse.jdt.junit.TEST_KIND", "org.eclipse.jdt.junit.loader.junit5");
 		wc.setAttribute("org.eclipse.jdt.launching.MAIN_TYPE", "");
 		wc.setAttribute("org.eclipse.jdt.junit.TESTNAME", "");
@@ -167,7 +168,7 @@ public class BmTestLaunchShortcut implements ILaunchShortcut2 {
 
 		// Mapped resources
 		wc.setAttribute("org.eclipse.debug.core.MAPPED_RESOURCE_PATHS",
-				java.util.List.of("/" + info.symbolicName));
+				java.util.List.of("/" + projectName));
 		wc.setAttribute("org.eclipse.debug.core.MAPPED_RESOURCE_TYPES",
 				java.util.List.of("4"));
 
