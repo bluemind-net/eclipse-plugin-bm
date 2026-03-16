@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feature
+      id="net.bluemind.devtools.testrunner.feature"
+      label="BM Test Runner"
+      version="1.0.0.qualifier"
+      provider-name="BlueMind">
+
+   <description>
+      Plugin Eclipse pour lancer les tests BlueMind (JUnit Plugin Tests)
+      avec une configuration pré-remplie.
+   </description>
+
+   <license url="">
+      Copyright (c) BlueMind. All rights reserved.
+   </license>
+
+   <plugin
+         id="net.bluemind.devtools.testrunner"
+         download-size="0"
+         install-size="0"
+         version="0.0.0"
+         unpack="false"/>
+
+</feature>

@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<?eclipse version="3.4"?>
+<plugin>
+
+   <extension point="org.eclipse.debug.ui.launchShortcuts">
+      <shortcut
+            class="net.bluemind.devtools.testrunner.BmTestLaunchShortcut"
+            id="net.bluemind.devtools.testrunner.launchShortcut"
+            label="BM Plugin Tests"
+            modes="run,debug">
+         <contextualLaunch>
+            <enablement>
+               <with variable="selection">
+                  <count value="1"/>
+                  <iterate>
+                     <adapt type="org.eclipse.core.resources.IResource">
+                        <test property="org.eclipse.core.resources.name" value="*.tests"/>
+                     </adapt>
+                  </iterate>
+               </with>
+            </enablement>
+         </contextualLaunch>
+         <configurationType id="org.eclipse.pde.ui.JunitLaunchConfig"/>
+      </shortcut>
+   </extension>
+
+</plugin>

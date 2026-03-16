@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<site>
+   <feature id="net.bluemind.devtools.testrunner.feature" version="0.0.0">
+      <category name="bm-devtools"/>
+   </feature>
+
+   <category-def name="bm-devtools" label="BlueMind Developer Tools">
+      <description>
+         Outils de développement BlueMind pour Eclipse.
+      </description>
+   </category-def>
+</site>
