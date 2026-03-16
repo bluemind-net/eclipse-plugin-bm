@@ -78,7 +78,9 @@ public class BmTestLaunchShortcut implements ILaunchShortcut2 {
 	}
 
 	private ILaunchConfiguration findOrCreateConfig(IProject project) throws CoreException {
-		String bundleName = project.getName();
+		BundleInfo info = readBundleInfo(project);
+		String projectName = project.getName();
+
 		ILaunchManager manager = DebugPlugin.getDefault().getLaunchManager();
 		ILaunchConfigurationType type = manager.getLaunchConfigurationType(LAUNCH_CONFIG_TYPE);
 
@@ -88,22 +90,23 @@ public class BmTestLaunchShortcut implements ILaunchShortcut2 {
 		}
 
 		for (ILaunchConfiguration existing : manager.getLaunchConfigurations(type)) {
-			if (existing.getName().equals(bundleName)) {
-				LOG.info("Reusing launch configuration: " + bundleName);
+			if (existing.getName().equals(projectName)) {
+				LOG.info("Reusing launch configuration: " + projectName);
 				return existing;
 			}
 		}
 
-		LOG.info("Creating launch configuration: " + bundleName);
-		ILaunchConfigurationWorkingCopy wc = type.newInstance(null, bundleName);
+		LOG.info("Creating launch configuration: " + projectName);
+		ILaunchConfigurationWorkingCopy wc = type.newInstance(null, projectName);
 
-		String version = getBundleVersion(project);
+		String additionalPlugin = info.fragmentHost != null
+				? info.fragmentHost + ":" + info.version + ":default:true:default:default"
+				: info.symbolicName + ":" + info.version + ":default:true:default:default";
 
 		// Plug-ins tab: "Launch with: features selected below"
 		wc.setAttribute("useCustomFeatures", true);
 		wc.setAttribute("selected_features", Set.of(BM_TEST_FEATURE));
-		wc.setAttribute("additional_plugins",
-				Set.of(bundleName + ":" + version + ":default:true:default:default"));
+		wc.setAttribute("additional_plugins", Set.of(additionalPlugin));
 
 		// Feature resolution
 		wc.setAttribute("featureDefaultLocation", "workspace");
@@ -115,8 +118,8 @@ public class BmTestLaunchShortcut implements ILaunchShortcut2 {
 		wc.setAttribute("checked", "[NONE]");
 
 		// Main tab
-		wc.setAttribute("org.eclipse.jdt.launching.PROJECT_ATTR", bundleName);
-		wc.setAttribute("org.eclipse.jdt.junit.CONTAINER", "=" + bundleName);
+		wc.setAttribute("org.eclipse.jdt.launching.PROJECT_ATTR", projectName);
+		wc.setAttribute("org.eclipse.jdt.junit.CONTAINER", "=" + projectName);
 		wc.setAttribute("org.eclipse.jdt.junit.TEST_KIND", "org.eclipse.jdt.junit.loader.junit5");
 		wc.setAttribute("org.eclipse.jdt.launching.MAIN_TYPE", "");
 		wc.setAttribute("org.eclipse.jdt.junit.TESTNAME", "");
@@ -165,29 +168,42 @@ public class BmTestLaunchShortcut implements ILaunchShortcut2 {
 
 		// Mapped resources
 		wc.setAttribute("org.eclipse.debug.core.MAPPED_RESOURCE_PATHS",
-				java.util.List.of("/" + bundleName));
+				java.util.List.of("/" + projectName));
 		wc.setAttribute("org.eclipse.debug.core.MAPPED_RESOURCE_TYPES",
 				java.util.List.of("4"));
 
 		return wc.doSave();
 	}
 
-	private String getBundleVersion(IProject project) {
+	private record BundleInfo(String symbolicName, String version, String fragmentHost) {}
+
+	private BundleInfo readBundleInfo(IProject project) {
+		String name = project.getName();
+		String version = "0.0.0";
+		String fragmentHost = null;
 		try {
 			var manifest = project.getFile("META-INF/MANIFEST.MF");
 			if (manifest.exists()) {
 				try (var is = manifest.getContents()) {
 					var attrs = new java.util.jar.Manifest(is).getMainAttributes();
-					String version = attrs.getValue("Bundle-Version");
-					if (version != null) {
-						return version;
+					String bsn = attrs.getValue("Bundle-SymbolicName");
+					if (bsn != null) {
+						name = bsn.split(";")[0].trim();
+					}
+					String ver = attrs.getValue("Bundle-Version");
+					if (ver != null) {
+						version = ver;
+					}
+					String fh = attrs.getValue("Fragment-Host");
+					if (fh != null) {
+						fragmentHost = fh.split(";")[0].trim();
 					}
 				}
 			}
 		} catch (Exception e) {
-			LOG.warn("Could not read bundle version for " + project.getName() + ": " + e.getMessage());
+			LOG.warn("Could not read MANIFEST.MF for " + project.getName() + ": " + e.getMessage());
 		}
-		return "0.0.0";
+		return new BundleInfo(name, version, fragmentHost);
 	}
 
 	private IProject getProject(ISelection selection) {
