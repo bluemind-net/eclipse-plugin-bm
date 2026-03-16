@@ -24,7 +24,7 @@ jobs:
           java-version: 21
 
       - name: Build with Tycho
-        run: mvn clean verify
+        run: mvn -B -ntp -nsu clean verify
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3

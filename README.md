@@ -17,7 +17,7 @@ Le plugin crée une launch configuration JUnit Plugin Test préconfigurée avec 
 
 ## Build local
 
-Prérequis : Java 17+, Maven 3.9+
+Prérequis : Java 21+, Maven 3.9+
 
 ```bash
 mvn clean verify
