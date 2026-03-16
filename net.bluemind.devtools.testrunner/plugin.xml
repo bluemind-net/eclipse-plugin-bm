@@ -5,6 +5,7 @@
    <extension point="org.eclipse.debug.ui.launchShortcuts">
       <shortcut
             class="net.bluemind.devtools.testrunner.BmTestLaunchShortcut"
+            icon="platform:/plugin/org.eclipse.pde.ui/icons/obj16/julaunchpgn.png"
             id="net.bluemind.devtools.testrunner.launchShortcut"
             label="BM Plugin Tests"
             modes="run,debug">
