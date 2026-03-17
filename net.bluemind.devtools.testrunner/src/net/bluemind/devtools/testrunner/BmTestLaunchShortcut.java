@@ -8,12 +8,19 @@ import org.eclipse.core.runtime.CoreException;
 import org.eclipse.core.runtime.ILog;
 import org.eclipse.core.runtime.Platform;
 import org.eclipse.core.runtime.Status;
+import org.eclipse.jdt.core.Flags;
 import org.eclipse.debug.core.DebugPlugin;
 import org.eclipse.debug.core.ILaunchConfiguration;
 import org.eclipse.debug.core.ILaunchConfigurationType;
 import org.eclipse.debug.core.ILaunchConfigurationWorkingCopy;
 import org.eclipse.debug.core.ILaunchManager;
 import org.eclipse.debug.ui.ILaunchShortcut2;
+import org.eclipse.jdt.core.ICompilationUnit;
+import org.eclipse.jdt.core.IJavaElement;
+import org.eclipse.jdt.core.IMethod;
+import org.eclipse.jdt.core.IType;
+import org.eclipse.jdt.ui.JavaUI;
+import org.eclipse.jface.text.ITextSelection;
 import org.eclipse.jface.viewers.ISelection;
 import org.eclipse.jface.viewers.IStructuredSelection;
 import org.eclipse.ui.IEditorPart;
@@ -26,29 +33,68 @@ public class BmTestLaunchShortcut implements ILaunchShortcut2 {
 
 	@Override
 	public void launch(ISelection selection, String mode) {
+		// Try Java element first (method, type, compilation unit from Outline/Package Explorer)
+		IJavaElement javaElement = getJavaElement(selection);
+		if (javaElement != null) {
+			launchJavaElement(javaElement, mode);
+			return;
+		}
+		// Fallback to project level
 		IProject project = getProject(selection);
 		if (project != null) {
-			launch(project, mode);
+			launchProject(project, mode);
 		}
 	}
 
 	@Override
 	public void launch(IEditorPart editor, String mode) {
+		try {
+			IJavaElement input = JavaUI.getEditorInputJavaElement(editor.getEditorInput());
+			if (!(input instanceof ICompilationUnit cu)) {
+				return;
+			}
+
+			// Get element at cursor position
+			var sel = editor.getSite().getSelectionProvider().getSelection();
+			if (sel instanceof ITextSelection textSel) {
+				IJavaElement element = cu.getElementAt(textSel.getOffset());
+				if (element instanceof IMethod || element instanceof IType) {
+					launchJavaElement(element, mode);
+					return;
+				}
+			}
+
+			// Fallback: launch the primary type
+			IType[] types = cu.getTypes();
+			if (types.length > 0) {
+				launchJavaElement(types[0], mode);
+			}
+		} catch (Exception e) {
+			LOG.log(new Status(Status.ERROR, Activator.PLUGIN_ID, "Failed to launch from editor", e));
+		}
 	}
 
 	@Override
 	public ILaunchConfiguration[] getLaunchConfigurations(ISelection selection) {
-		IProject project = getProject(selection);
-		if (project == null) {
-			return null;
-		}
 		try {
-			ILaunchConfiguration config = findOrCreateConfig(project);
-			return config != null ? new ILaunchConfiguration[] { config } : null;
+			IJavaElement javaElement = getJavaElement(selection);
+			if (javaElement != null) {
+				var resolved = resolveElement(javaElement);
+				if (resolved != null) {
+					ILaunchConfiguration config = findOrCreateConfig(
+							resolved.type.getJavaProject().getProject(), resolved.type, resolved.methodName);
+					return config != null ? new ILaunchConfiguration[] { config } : null;
+				}
+			}
+			IProject project = getProject(selection);
+			if (project != null) {
+				ILaunchConfiguration config = findOrCreateConfig(project, null, null);
+				return config != null ? new ILaunchConfiguration[] { config } : null;
+			}
 		} catch (CoreException e) {
 			LOG.log(new Status(Status.ERROR, Activator.PLUGIN_ID, "Failed to get launch config", e));
-			return null;
 		}
+		return null;
 	}
 
 	@Override
@@ -66,47 +112,134 @@ public class BmTestLaunchShortcut implements ILaunchShortcut2 {
 		return null;
 	}
 
-	private void launch(IProject project, String mode) {
+	/**
+	 * Public entry point for launching a specific type/method, used by the code
+	 * mining provider.
+	 */
+	public static void launchElement(IType type, String methodName, String mode) {
 		try {
-			ILaunchConfiguration config = findOrCreateConfig(project);
-			if (config != null) {
-				config.launch(mode, null);
+			if (Flags.isAbstract(type.getFlags())) {
+				LOG.warn("Cannot run tests on abstract class: " + type.getFullyQualifiedName());
+				return;
 			}
-		} catch (CoreException e) {
-			LOG.log(new Status(Status.ERROR, Activator.PLUGIN_ID, "Failed to launch tests", e));
+		} catch (Exception e) {
+			return;
 		}
+		new BmTestLaunchShortcut().launchInJob(type.getJavaProject().getProject(), type, methodName, mode);
 	}
 
-	private ILaunchConfiguration findOrCreateConfig(IProject project) throws CoreException {
+	private record ResolvedElement(IType type, String methodName) {
+	}
+
+	private ResolvedElement resolveElement(IJavaElement element) {
+		try {
+			if (element instanceof IMethod method) {
+				IType declaring = method.getDeclaringType();
+				if (Flags.isAbstract(declaring.getFlags())) {
+					LOG.warn("Cannot run tests on abstract class: " + declaring.getFullyQualifiedName());
+					return null;
+				}
+				return new ResolvedElement(declaring, method.getElementName());
+			} else if (element instanceof IType type) {
+				if (Flags.isAbstract(type.getFlags())) {
+					LOG.warn("Cannot run tests on abstract class: " + type.getFullyQualifiedName());
+					return null;
+				}
+				return new ResolvedElement(type, null);
+			} else if (element instanceof ICompilationUnit cu) {
+				IType[] types = cu.getTypes();
+				if (types.length > 0 && !Flags.isAbstract(types[0].getFlags())) {
+					return new ResolvedElement(types[0], null);
+				}
+			}
+		} catch (Exception e) {
+			LOG.warn("Failed to resolve Java element: " + e.getMessage());
+		}
+		return null;
+	}
+
+	private void launchJavaElement(IJavaElement element, String mode) {
+		var resolved = resolveElement(element);
+		if (resolved == null) {
+			return;
+		}
+		launchInJob(resolved.type.getJavaProject().getProject(), resolved.type, resolved.methodName, mode);
+	}
+
+	private void launchProject(IProject project, String mode) {
+		launchInJob(project, null, null, mode);
+	}
+
+	private void launchInJob(IProject project, IType type, String methodName, String mode) {
+		String label = type != null
+				? "Launching BM test: " + type.getElementName() + (methodName != null ? "." + methodName : "")
+				: "Launching BM tests: " + project.getName();
+		org.eclipse.core.runtime.jobs.Job job = new org.eclipse.core.runtime.jobs.Job(label) {
+			@Override
+			protected org.eclipse.core.runtime.IStatus run(org.eclipse.core.runtime.IProgressMonitor monitor) {
+				try {
+					ILaunchConfiguration config = findOrCreateConfig(project, type, methodName);
+					if (config != null) {
+						config.launch(mode, null);
+					}
+				} catch (CoreException e) {
+					LOG.log(new Status(Status.ERROR, Activator.PLUGIN_ID, "Failed to launch tests", e));
+				}
+				return Status.OK_STATUS;
+			}
+		};
+		job.setUser(true);
+		job.schedule();
+	}
+
+	private ILaunchConfiguration findOrCreateConfig(IProject project, IType type, String methodName)
+			throws CoreException {
 		BundleInfo info = readBundleInfo(project);
 		String projectName = project.getName();
 
-		ILaunchManager manager = DebugPlugin.getDefault().getLaunchManager();
-		ILaunchConfigurationType type = manager.getLaunchConfigurationType(LAUNCH_CONFIG_TYPE);
+		// Config name depends on granularity
+		String configName = projectName;
+		if (type != null) {
+			configName = projectName + " - " + type.getElementName();
+			if (methodName != null) {
+				configName += "." + methodName;
+			}
+		}
 
-		if (type == null) {
+		ILaunchManager manager = DebugPlugin.getDefault().getLaunchManager();
+		ILaunchConfigurationType lcType = manager.getLaunchConfigurationType(LAUNCH_CONFIG_TYPE);
+
+		if (lcType == null) {
 			LOG.warn("Launch config type not found: " + LAUNCH_CONFIG_TYPE);
 			return null;
 		}
 
-		for (ILaunchConfiguration existing : manager.getLaunchConfigurations(type)) {
-			if (existing.getName().equals(projectName)) {
-				LOG.info("Reusing launch configuration: " + projectName);
-				return existing;
+		for (ILaunchConfiguration existing : manager.getLaunchConfigurations(lcType)) {
+			if (existing.getName().equals(configName)) {
+				LOG.info("Deleting stale launch configuration: " + configName);
+				existing.delete();
+				break;
 			}
 		}
 
-		LOG.info("Creating launch configuration: " + projectName);
-		ILaunchConfigurationWorkingCopy wc = type.newInstance(null, projectName);
+		LOG.info("Creating launch configuration: " + configName);
+		ILaunchConfigurationWorkingCopy wc = lcType.newInstance(null, configName);
 
-		String additionalPlugin = info.fragmentHost != null
-				? info.fragmentHost + ":" + info.version + ":default:true:default:default"
-				: info.symbolicName + ":" + info.version + ":default:true:default:default";
+		Set<String> additionalPlugins;
+		if (info.fragmentHost != null) {
+			// Fragment: include both the fragment and its host bundle
+			String fragment = info.symbolicName + ":" + info.version + ":default:true:default:default";
+			String host = info.fragmentHost + ":0.0.0:default:true:default:default";
+			additionalPlugins = Set.of(fragment, host);
+		} else {
+			additionalPlugins = Set.of(
+					info.symbolicName + ":" + info.version + ":default:true:default:default");
+		}
 
 		// Plug-ins tab: "Launch with: features selected below"
 		wc.setAttribute("useCustomFeatures", true);
 		wc.setAttribute("selected_features", Set.of(BM_TEST_FEATURE));
-		wc.setAttribute("additional_plugins", Set.of(additionalPlugin));
+		wc.setAttribute("additional_plugins", additionalPlugins);
 
 		// Feature resolution
 		wc.setAttribute("featureDefaultLocation", "workspace");
@@ -117,13 +250,22 @@ public class BmTestLaunchShortcut implements ILaunchShortcut2 {
 		wc.setAttribute("default", false);
 		wc.setAttribute("checked", "[NONE]");
 
-		// Main tab
+		// Main tab — depends on granularity
 		wc.setAttribute("org.eclipse.jdt.launching.PROJECT_ATTR", projectName);
-		wc.setAttribute("org.eclipse.jdt.junit.CONTAINER", "=" + projectName);
 		wc.setAttribute("org.eclipse.jdt.junit.TEST_KIND", "org.eclipse.jdt.junit.loader.junit5");
-		wc.setAttribute("org.eclipse.jdt.launching.MAIN_TYPE", "");
-		wc.setAttribute("org.eclipse.jdt.junit.TESTNAME", "");
 		wc.setAttribute("org.eclipse.jdt.junit.KEEPRUNNING_ATTR", false);
+
+		if (type != null) {
+			// Class or method level: use type handle as container
+			wc.setAttribute("org.eclipse.jdt.junit.CONTAINER", type.getHandleIdentifier());
+			wc.setAttribute("org.eclipse.jdt.launching.MAIN_TYPE", type.getFullyQualifiedName());
+			wc.setAttribute("org.eclipse.jdt.junit.TESTNAME", methodName != null ? methodName : "");
+		} else {
+			// Project level
+			wc.setAttribute("org.eclipse.jdt.junit.CONTAINER", "=" + projectName);
+			wc.setAttribute("org.eclipse.jdt.launching.MAIN_TYPE", "");
+			wc.setAttribute("org.eclipse.jdt.junit.TESTNAME", "");
+		}
 
 		// Application / product
 		wc.setAttribute("application", "org.eclipse.pde.junit.runtime.coretestapplication");
@@ -175,7 +317,8 @@ public class BmTestLaunchShortcut implements ILaunchShortcut2 {
 		return wc.doSave();
 	}
 
-	private record BundleInfo(String symbolicName, String version, String fragmentHost) {}
+	private record BundleInfo(String symbolicName, String version, String fragmentHost) {
+	}
 
 	private BundleInfo readBundleInfo(IProject project) {
 		String name = project.getName();
@@ -204,6 +347,20 @@ public class BmTestLaunchShortcut implements ILaunchShortcut2 {
 			LOG.warn("Could not read MANIFEST.MF for " + project.getName() + ": " + e.getMessage());
 		}
 		return new BundleInfo(name, version, fragmentHost);
+	}
+
+	private IJavaElement getJavaElement(ISelection selection) {
+		if (!(selection instanceof IStructuredSelection structured) || structured.isEmpty()) {
+			return null;
+		}
+		Object element = structured.getFirstElement();
+		if (element instanceof IJavaElement je) {
+			return je;
+		}
+		if (element instanceof org.eclipse.core.runtime.IAdaptable adaptable) {
+			return adaptable.getAdapter(IJavaElement.class);
+		}
+		return null;
 	}
 
 	private IProject getProject(ISelection selection) {

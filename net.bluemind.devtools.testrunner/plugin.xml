@@ -23,6 +23,65 @@
          </contextualLaunch>
          <configurationType id="org.eclipse.pde.ui.JunitLaunchConfig"/>
       </shortcut>
+
+      <shortcut
+            class="net.bluemind.devtools.testrunner.BmTestLaunchShortcut"
+            icon="platform:/plugin/org.eclipse.pde.ui/icons/obj16/julaunchpgn.png"
+            id="net.bluemind.devtools.testrunner.launchShortcut.javaElement"
+            label="BM Plugin Tests"
+            modes="run,debug">
+         <contextualLaunch>
+            <enablement>
+               <with variable="selection">
+                  <count value="1"/>
+                  <iterate>
+                     <or>
+                        <adapt type="org.eclipse.jdt.core.IMethod">
+                           <test property="net.bluemind.devtools.testrunner.isInTestProject"/>
+                        </adapt>
+                        <adapt type="org.eclipse.jdt.core.IType">
+                           <test property="net.bluemind.devtools.testrunner.isInTestProject"/>
+                        </adapt>
+                        <adapt type="org.eclipse.jdt.core.ICompilationUnit">
+                           <test property="net.bluemind.devtools.testrunner.isInTestProject"/>
+                        </adapt>
+                     </or>
+                  </iterate>
+               </with>
+            </enablement>
+         </contextualLaunch>
+         <configurationType id="org.eclipse.pde.ui.JunitLaunchConfig"/>
+      </shortcut>
+   </extension>
+
+   <extension point="org.eclipse.core.expressions.propertyTesters">
+      <propertyTester
+            id="net.bluemind.devtools.testrunner.testProjectTester"
+            type="org.eclipse.jdt.core.IJavaElement"
+            namespace="net.bluemind.devtools.testrunner"
+            properties="isInTestProject"
+            class="net.bluemind.devtools.testrunner.TestProjectTester"/>
+   </extension>
+
+   <extension point="org.eclipse.ui.workbench.texteditor.codeMiningProviders">
+      <codeMiningProvider
+            id="net.bluemind.devtools.testrunner.testCodeMining"
+            class="net.bluemind.devtools.testrunner.BmTestCodeMiningProvider">
+         <enabledWhen>
+            <with variable="editorInput">
+               <adapt type="org.eclipse.core.resources.IFile">
+                  <test property="org.eclipse.core.resources.extension" value="java"/>
+               </adapt>
+            </with>
+         </enabledWhen>
+      </codeMiningProvider>
+   </extension>
+
+   <extension point="org.eclipse.ui.preferencePages">
+      <page
+            id="net.bluemind.devtools.testrunner.preferences"
+            name="BlueMind"
+            class="net.bluemind.devtools.testrunner.BmPreferencePage"/>
    </extension>
 
    <extension point="org.eclipse.ui.commands">

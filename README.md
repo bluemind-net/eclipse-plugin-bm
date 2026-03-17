@@ -14,9 +14,19 @@ Plugin Eclipse pour le développement BlueMind. Il fournit deux fonctionnalités
 
 ## Lancement des tests
 
-Clic droit sur un projet `*.tests` → **Run As → BM Plugin Tests**.
+Le plugin offre plusieurs niveaux de granularité pour lancer les JUnit Plugin Tests :
 
-Le plugin crée une launch configuration JUnit Plugin Test préconfigurée avec `net.bluemind.tests.feature` et la lance. Si une configuration existe déjà pour ce projet, elle est réutilisée.
+- **Projet** : clic droit sur un projet `*.tests` → **Run As → BM Plugin Tests**
+- **Classe** : clic droit sur une classe de test (Package Explorer, Outline) → **Run As → BM Plugin Tests**
+- **Méthode** : clic droit sur une méthode `@Test` (Outline, ou curseur dans l'éditeur) → **Run As → BM Plugin Tests**
+
+Le plugin crée une launch configuration PDE JUnit préconfigurée avec `net.bluemind.tests.feature` et gère automatiquement les fragments (Fragment-Host). Les classes abstraites sont ignorées.
+
+### Code Mining (optionnel)
+
+Le plugin peut afficher des indicateurs `▶ Run` / `▶ Debug` au-dessus des méthodes `@Test` et des classes de test directement dans l'éditeur. Cette fonctionnalité est **désactivée par défaut**.
+
+Pour l'activer : **Window → Preferences → BlueMind** → cocher "Show Run/Debug code mining above test methods".
 
 ## Synchronisation POM
 

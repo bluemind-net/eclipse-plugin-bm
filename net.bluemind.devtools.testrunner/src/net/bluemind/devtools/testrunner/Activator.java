@@ -13,6 +13,7 @@ public class Activator extends AbstractUIPlugin {
 	public void start(BundleContext context) throws Exception {
 		super.start(context);
 		plugin = this;
+		getPreferenceStore().setDefault("codeMining.enabled", false);
 		PomFileWatcher.instance().start();
 	}
 
