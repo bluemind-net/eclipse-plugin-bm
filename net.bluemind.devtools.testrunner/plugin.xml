@@ -25,4 +25,28 @@
       </shortcut>
    </extension>
 
+   <extension point="org.eclipse.ui.commands">
+      <command
+            id="net.bluemind.devtools.testrunner.pomSync"
+            name="Check POM Sync"
+            description="Check if workspace settings match the BlueMind global POM"/>
+   </extension>
+
+   <extension point="org.eclipse.ui.handlers">
+      <handler
+            commandId="net.bluemind.devtools.testrunner.pomSync"
+            class="net.bluemind.devtools.testrunner.PomSyncHandler"/>
+   </extension>
+
+   <extension point="org.eclipse.ui.menus">
+      <menuContribution locationURI="menu:org.eclipse.ui.main.menu?after=additions">
+         <menu id="net.bluemind.devtools.menu" label="BlueMind">
+            <command
+                  commandId="net.bluemind.devtools.testrunner.pomSync"
+                  label="Check POM Sync..."
+                  style="push"/>
+         </menu>
+      </menuContribution>
+   </extension>
+
 </plugin>

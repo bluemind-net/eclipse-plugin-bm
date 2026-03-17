@@ -13,10 +13,12 @@ public class Activator extends AbstractUIPlugin {
 	public void start(BundleContext context) throws Exception {
 		super.start(context);
 		plugin = this;
+		PomFileWatcher.instance().start();
 	}
 
 	@Override
 	public void stop(BundleContext context) throws Exception {
+		PomFileWatcher.instance().stop();
 		plugin = null;
 		super.stop(context);
 	}
