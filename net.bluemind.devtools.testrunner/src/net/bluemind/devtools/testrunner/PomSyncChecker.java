@@ -1,26 +1,33 @@
 package net.bluemind.devtools.testrunner;
 
-import java.nio.file.Path;
-
-import javax.xml.parsers.DocumentBuilderFactory;
-import javax.xml.transform.OutputKeys;
-import javax.xml.transform.TransformerFactory;
-import javax.xml.transform.dom.DOMSource;
-import javax.xml.transform.stream.StreamResult;
+import java.net.URI;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.eclipse.core.runtime.ILog;
+import org.eclipse.core.runtime.IProgressMonitor;
+import org.eclipse.core.runtime.IStatus;
 import org.eclipse.core.runtime.Platform;
+import org.eclipse.core.runtime.Status;
+import org.eclipse.core.runtime.jobs.Job;
+import org.eclipse.equinox.p2.core.IProvisioningAgent;
+import org.eclipse.equinox.p2.metadata.IInstallableUnit;
+import org.eclipse.equinox.p2.query.QueryUtil;
+import org.eclipse.equinox.p2.repository.metadata.IMetadataRepositoryManager;
 import org.eclipse.jdt.launching.IVMInstall;
 import org.eclipse.jdt.launching.JavaRuntime;
 import org.eclipse.jdt.launching.VMStandin;
 import org.eclipse.jface.dialogs.MessageDialog;
+import org.eclipse.pde.core.target.ITargetLocation;
+import org.eclipse.pde.core.target.ITargetPlatformService;
+import org.eclipse.pde.core.target.LoadTargetDefinitionJob;
 import org.eclipse.swt.widgets.Display;
 import org.eclipse.swt.widgets.Shell;
 import org.eclipse.ui.IWorkbenchWindow;
 import org.eclipse.ui.PlatformUI;
-import org.w3c.dom.Document;
-import org.w3c.dom.Element;
-import org.w3c.dom.NodeList;
 
 import net.bluemind.devtools.testrunner.PomPropertyReader.PomProperties;
 import net.bluemind.devtools.testrunner.WorkspaceConfigReader.WorkspaceConfig;
@@ -29,6 +36,13 @@ public class PomSyncChecker {
 
 	private static final ILog LOG = Platform.getLog(PomSyncChecker.class);
 	private static final String BM_REPO_BASE = "https://forge.bluemind.net/staging/p2/dependencies/";
+	private static final String BM_REPO_PATTERN = "forge.bluemind.net/staging/p2/dependencies/";
+	private static final AtomicBoolean dialogOpen = new AtomicBoolean();
+
+	// IUBundleContainer resolution flags
+	private static final int INCLUDE_REQUIRED = 1 << 0;
+	private static final int INCLUDE_SOURCE = 1 << 2;
+	private static final int INCLUDE_CONFIGURE_PHASE = 1 << 3;
 
 	public record SyncStatus(
 			boolean vmArgsMismatch,
@@ -53,28 +67,43 @@ public class PomSyncChecker {
 	 * @param showIfInSync if true, shows an "all good" message when in sync
 	 */
 	public static void checkAndPrompt(boolean showIfInSync) {
+		if (!dialogOpen.compareAndSet(false, true)) {
+			return;
+		}
+
 		SyncStatus status = computeStatus();
 		if (status == null) {
+			dialogOpen.set(false);
 			return;
 		}
 
 		if (!status.hasMismatch()) {
 			if (showIfInSync) {
 				Display.getDefault().asyncExec(() -> {
-					Shell shell = getShell();
-					if (shell != null) {
-						MessageDialog.openInformation(shell, "BlueMind POM Sync",
-								"Workspace settings are in sync with the global POM.");
+					try {
+						Shell shell = getShell();
+						if (shell != null) {
+							MessageDialog.openInformation(shell, "BlueMind POM Sync",
+									"Workspace settings are in sync with the global POM.");
+						}
+					} finally {
+						dialogOpen.set(false);
 					}
 				});
+			} else {
+				dialogOpen.set(false);
 			}
 			return;
 		}
 
 		Display.getDefault().asyncExec(() -> {
-			Shell shell = getShell();
-			if (shell != null) {
-				showSyncDialog(shell, status);
+			try {
+				Shell shell = getShell();
+				if (shell != null) {
+					showSyncDialog(shell, status);
+				}
+			} finally {
+				dialogOpen.set(false);
 			}
 		});
 	}
@@ -124,10 +153,17 @@ public class PomSyncChecker {
 		}
 
 		if (status.targetPlatformMismatch) {
-			msg.append("• Target Platform\n");
-			String currentUrl = status.workspaceConfig.targetRepoUrl();
-			msg.append("  Current: ").append(currentUrl != null ? currentUrl : "(not set)").append("\n");
-			msg.append("  Expected: ").append(BM_REPO_BASE).append(status.pomProps.targetPlatformVersion())
+			boolean noTarget = !status.workspaceConfig.hasTarget();
+			msg.append("• Target Platform");
+			if (noTarget) {
+				msg.append(" (will be created)");
+			}
+			msg.append("\n");
+			if (!noTarget) {
+				String currentUrl = status.workspaceConfig.targetRepoUrl();
+				msg.append("  Current: ").append(currentUrl != null ? currentUrl : "(no BlueMind repo)").append("\n");
+			}
+			msg.append("  URL: ").append(BM_REPO_BASE).append(status.pomProps.targetPlatformVersion())
 					.append("\n\n");
 		}
 
@@ -144,7 +180,7 @@ public class PomSyncChecker {
 			applyVmArgsSync(status.pomProps.resolvedTestArgLine());
 		}
 		if (status.targetPlatformMismatch) {
-			applyTargetSync(status.workspaceConfig.targetFilePath(), status.pomProps.targetPlatformVersion());
+			applyTargetSync(status.pomProps.targetPlatformVersion());
 		}
 	}
 
@@ -166,82 +202,115 @@ public class PomSyncChecker {
 		}
 	}
 
-	private static void applyTargetSync(Path targetFilePath, String newVersion) {
-		if (targetFilePath == null) {
-			LOG.warn("No target file path to update");
-			return;
-		}
+	private static void applyTargetSync(String newVersion) {
+		new Job("Updating BlueMind target platform") {
+			@Override
+			protected IStatus run(IProgressMonitor monitor) {
+				try {
+					monitor.beginTask("Fetching P2 repository metadata", IProgressMonitor.UNKNOWN);
 
-		try {
-			Document doc = DocumentBuilderFactory.newInstance().newDocumentBuilder()
-					.parse(targetFilePath.toFile());
+					URI repoUri = URI.create(BM_REPO_BASE + newVersion);
+					List<IInstallableUnit> units = queryP2Repository(repoUri, monitor);
 
-			// Find the <location> element that contains the BlueMind repository
-			NodeList locations = doc.getElementsByTagName("location");
-			boolean updated = false;
-			for (int i = 0; i < locations.getLength(); i++) {
-				Element loc = (Element) locations.item(i);
-				NodeList repos = loc.getElementsByTagName("repository");
-				for (int j = 0; j < repos.getLength(); j++) {
-					Element repo = (Element) repos.item(j);
-					String repoUrl = repo.getAttribute("location");
-					if (repoUrl != null && repoUrl.contains("forge.bluemind.net/staging/p2/dependencies/")) {
-						repo.setAttribute("location", BM_REPO_BASE + newVersion);
-						updated = true;
-
-						// Reset all unit versions in this location to 0.0.0
-						// so they resolve to whatever is available in the new repo
-						NodeList units = loc.getElementsByTagName("unit");
-						for (int k = 0; k < units.getLength(); k++) {
-							((Element) units.item(k)).setAttribute("version", "0.0.0");
-						}
+					var ctx = Activator.getDefault().getBundle().getBundleContext();
+					var ref = ctx.getServiceReference(ITargetPlatformService.class);
+					if (ref == null) {
+						LOG.warn("ITargetPlatformService not available");
+						return Status.error("ITargetPlatformService not available");
 					}
+					var service = ctx.getService(ref);
+					try {
+						var handle = service.getWorkspaceTargetHandle();
+						var target = handle != null
+								? handle.getTargetDefinition()
+								: service.newTarget();
+						if (handle == null) {
+							target.setName("BlueMind");
+						}
+
+						var iuArray = units.toArray(new IInstallableUnit[0]);
+						int flags = INCLUDE_REQUIRED | INCLUDE_SOURCE | INCLUDE_CONFIGURE_PHASE;
+						ITargetLocation bmLocation = service.newIULocation(iuArray, new URI[] { repoUri }, flags);
+
+						ITargetLocation[] existing = target.getTargetLocations();
+						target.setTargetLocations(replaceOrAddBmLocation(existing, bmLocation));
+
+						service.saveTargetDefinition(target);
+						new LoadTargetDefinitionJob(target).schedule();
+
+						LOG.info("Target platform updated with " + units.size() + " units from " + repoUri);
+					} finally {
+						ctx.ungetService(ref);
+					}
+
+					return Status.OK_STATUS;
+				} catch (Exception e) {
+					LOG.error("Failed to update target platform", e);
+					return Status.error("Failed to update target platform", e);
+				} finally {
+					monitor.done();
 				}
 			}
-
-			if (!updated) {
-				LOG.warn("No BlueMind repository found in target file: " + targetFilePath);
-				return;
-			}
-
-			// Write back the modified XML
-			var transformer = TransformerFactory.newInstance().newTransformer();
-			transformer.setOutputProperty(OutputKeys.INDENT, "yes");
-			transformer.setOutputProperty(OutputKeys.ENCODING, "UTF-8");
-			transformer.setOutputProperty(OutputKeys.STANDALONE, "no");
-			transformer.transform(new DOMSource(doc), new StreamResult(targetFilePath.toFile()));
-
-			LOG.info("Updated target platform repository URL to: " + BM_REPO_BASE + newVersion);
-
-			// Reload the target platform
-			reloadTargetPlatform();
-		} catch (Exception e) {
-			LOG.error("Failed to update target platform", e);
-		}
+		}.schedule();
 	}
 
-	private static void reloadTargetPlatform() {
+	private static ITargetLocation[] replaceOrAddBmLocation(ITargetLocation[] existing, ITargetLocation bmLocation) {
+		if (existing == null || existing.length == 0) {
+			return new ITargetLocation[] { bmLocation };
+		}
+		for (int i = 0; i < existing.length; i++) {
+			String xml = existing[i].serialize();
+			if (xml != null && xml.contains(BM_REPO_PATTERN)) {
+				existing[i] = bmLocation;
+				return existing;
+			}
+		}
+		var result = new ITargetLocation[existing.length + 1];
+		System.arraycopy(existing, 0, result, 0, existing.length);
+		result[existing.length] = bmLocation;
+		return result;
+	}
+
+	private static List<IInstallableUnit> queryP2Repository(URI repoUri, IProgressMonitor monitor) {
+		var deduplicated = new LinkedHashMap<String, IInstallableUnit>();
 		try {
 			var ctx = Activator.getDefault().getBundle().getBundleContext();
-			var ref = ctx
-					.getServiceReference(org.eclipse.pde.core.target.ITargetPlatformService.class);
-			if (ref == null) {
-				LOG.warn("ITargetPlatformService not available for reload");
-				return;
+			var agentRef = ctx.getServiceReference(IProvisioningAgent.class);
+			if (agentRef == null) {
+				LOG.warn("IProvisioningAgent not available");
+				return List.of();
 			}
-
-			var service = ctx.getService(ref);
+			var agent = ctx.getService(agentRef);
 			try {
-				var handle = service.getWorkspaceTargetHandle();
-				var target = handle.getTargetDefinition();
-				new org.eclipse.pde.core.target.LoadTargetDefinitionJob(target).schedule();
-				LOG.info("Target platform reload scheduled");
+				var repoManager = (IMetadataRepositoryManager) agent
+						.getService(IMetadataRepositoryManager.class.getName());
+				if (repoManager == null) {
+					LOG.warn("IMetadataRepositoryManager not available");
+					return List.of();
+				}
+				var repo = repoManager.loadRepository(repoUri, monitor);
+				var result = repo.query(QueryUtil.createIUAnyQuery(), monitor);
+				for (IInstallableUnit iu : result) {
+					String id = iu.getId();
+					if (id.startsWith("a.jre.")) continue;
+					if (id.endsWith(".feature.jar")) continue;
+					if ("true".equals(iu.getProperty("org.eclipse.equinox.p2.type.category"))) continue;
+					if (iu.getFilter() != null) continue;
+
+					var existing = deduplicated.get(id);
+					if (existing == null || iu.getVersion().compareTo(existing.getVersion()) > 0) {
+						deduplicated.put(id, iu);
+					}
+				}
 			} finally {
-				ctx.ungetService(ref);
+				ctx.ungetService(agentRef);
 			}
 		} catch (Exception e) {
-			LOG.error("Failed to reload target platform", e);
+			LOG.error("Failed to query P2 repository: " + repoUri, e);
 		}
+		var units = new ArrayList<>(deduplicated.values());
+		units.sort(Comparator.comparing(IInstallableUnit::getId));
+		return units;
 	}
 
 	private static String normalize(String s) {

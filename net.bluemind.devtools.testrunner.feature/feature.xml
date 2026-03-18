@@ -2,7 +2,7 @@
 <feature
       id="net.bluemind.devtools.testrunner.feature"
       label="BM Test Runner"
-      version="1.2.0.qualifier"
+      version="1.3.0.qualifier"
       provider-name="BlueMind">
 
    <description>
