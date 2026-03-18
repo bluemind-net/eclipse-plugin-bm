@@ -354,11 +354,14 @@ public class BmTestLaunchShortcut implements ILaunchShortcut2 {
 			return null;
 		}
 		Object element = structured.getFirstElement();
-		if (element instanceof IJavaElement je) {
-			return je;
+		IJavaElement je = null;
+		if (element instanceof IJavaElement j) {
+			je = j;
+		} else if (element instanceof org.eclipse.core.runtime.IAdaptable adaptable) {
+			je = adaptable.getAdapter(IJavaElement.class);
 		}
-		if (element instanceof org.eclipse.core.runtime.IAdaptable adaptable) {
-			return adaptable.getAdapter(IJavaElement.class);
+		if (je instanceof IMethod || je instanceof IType || je instanceof ICompilationUnit) {
+			return je;
 		}
 		return null;
 	}
