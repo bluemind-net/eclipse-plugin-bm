@@ -2,6 +2,7 @@ package net.bluemind.devtools.testrunner;
 
 import java.util.Optional;
 
+import org.eclipse.core.runtime.CoreException;
 import org.eclipse.core.runtime.ILog;
 import org.eclipse.core.runtime.Platform;
 import org.eclipse.jdt.launching.IVMInstall;
@@ -14,7 +15,10 @@ public class WorkspaceConfigReader {
 	private static final ILog LOG = Platform.getLog(WorkspaceConfigReader.class);
 	private static final String BM_REPO_PATTERN = "forge.bluemind.net/staging/p2/dependencies/";
 
-	public record WorkspaceConfig(String vmArgs, String targetRepoUrl, String vmName, boolean hasTarget) {
+	public record BmLocationInfo(String mode, String location) {
+	}
+
+	public record WorkspaceConfig(String vmArgs, BmLocationInfo bmLocation, String vmName, boolean hasTarget) {
 	}
 
 	public static Optional<WorkspaceConfig> read() {
@@ -31,7 +35,7 @@ public class WorkspaceConfigReader {
 				vmArgs = String.join(" ", args);
 			}
 
-			String repoUrl = null;
+			BmLocationInfo bmLocation = null;
 			boolean hasTarget = false;
 
 			var ctx = Activator.getDefault().getBundle().getBundleContext();
@@ -43,33 +47,45 @@ public class WorkspaceConfigReader {
 					if (handle != null) {
 						hasTarget = true;
 						var target = handle.getTargetDefinition();
-						repoUrl = findBmRepoUrl(target.getTargetLocations());
+						bmLocation = findBmLocationInfo(target.getTargetLocations());
 					}
 				} finally {
 					ctx.ungetService(ref);
 				}
 			}
 
-			return Optional.of(new WorkspaceConfig(vmArgs, repoUrl, defaultVm.getName(), hasTarget));
+			return Optional.of(new WorkspaceConfig(vmArgs, bmLocation, defaultVm.getName(), hasTarget));
 		} catch (Exception e) {
 			LOG.error("Failed to read workspace config", e);
 			return Optional.empty();
 		}
 	}
 
-	static String findBmRepoUrl(ITargetLocation[] locations) {
+	static BmLocationInfo findBmLocationInfo(ITargetLocation[] locations) {
 		if (locations == null) return null;
+		BmLocationInfo directoryCandidate = null;
 		for (ITargetLocation loc : locations) {
 			String xml = loc.serialize();
-			if (xml == null || !xml.contains(BM_REPO_PATTERN)) continue;
-			int idx = xml.indexOf(BM_REPO_PATTERN);
-			int start = xml.lastIndexOf("=\"", idx);
-			if (start < 0) continue;
-			start += 2;
-			int end = xml.indexOf('"', idx);
-			if (end < 0) continue;
-			return xml.substring(start, end);
+			if (xml != null && xml.contains(BM_REPO_PATTERN)) {
+				int idx = xml.indexOf(BM_REPO_PATTERN);
+				int start = xml.lastIndexOf("=\"", idx);
+				if (start < 0) continue;
+				start += 2;
+				int end = xml.indexOf('"', idx);
+				if (end < 0) continue;
+				return new BmLocationInfo("http", xml.substring(start, end));
+			}
+
+			if ("Directory".equals(loc.getType()) && directoryCandidate == null) {
+				try {
+					String locPath = loc.getLocation(true);
+					if (locPath != null) {
+						directoryCandidate = new BmLocationInfo("directory", locPath);
+					}
+				} catch (CoreException ignored) {
+				}
+			}
 		}
-		return null;
+		return directoryCandidate;
 	}
 }

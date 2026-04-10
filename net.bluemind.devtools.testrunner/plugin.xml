@@ -14,38 +14,10 @@
                <with variable="selection">
                   <count value="1"/>
                   <iterate>
-                     <adapt type="org.eclipse.core.resources.IResource">
-                        <test property="org.eclipse.core.resources.name" value="*.tests"/>
+                     <adapt type="org.eclipse.jdt.core.IJavaElement">
+                        <test property="net.bluemind.devtools.testrunner.isInTestProject"/>
+                        <test property="org.eclipse.jdt.junit.canLaunchAsJUnit" forcePluginActivation="true"/>
                      </adapt>
-                  </iterate>
-               </with>
-            </enablement>
-         </contextualLaunch>
-         <configurationType id="org.eclipse.pde.ui.JunitLaunchConfig"/>
-      </shortcut>
-
-      <shortcut
-            class="net.bluemind.devtools.testrunner.BmTestLaunchShortcut"
-            icon="platform:/plugin/org.eclipse.pde.ui/icons/obj16/julaunchpgn.png"
-            id="net.bluemind.devtools.testrunner.launchShortcut.javaElement"
-            label="BM Plugin Tests"
-            modes="run,debug">
-         <contextualLaunch>
-            <enablement>
-               <with variable="selection">
-                  <count value="1"/>
-                  <iterate>
-                     <or>
-                        <adapt type="org.eclipse.jdt.core.IMethod">
-                           <test property="net.bluemind.devtools.testrunner.isInTestProject"/>
-                        </adapt>
-                        <adapt type="org.eclipse.jdt.core.IType">
-                           <test property="net.bluemind.devtools.testrunner.isInTestProject"/>
-                        </adapt>
-                        <adapt type="org.eclipse.jdt.core.ICompilationUnit">
-                           <test property="net.bluemind.devtools.testrunner.isInTestProject"/>
-                        </adapt>
-                     </or>
                   </iterate>
                </with>
             </enablement>

@@ -7,6 +7,7 @@ import java.nio.file.StandardWatchEventKinds;
 import java.nio.file.WatchEvent;
 import java.nio.file.WatchKey;
 import java.nio.file.WatchService;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.eclipse.core.runtime.ILog;
 import org.eclipse.core.runtime.IProgressMonitor;
@@ -24,6 +25,7 @@ public class PomFileWatcher {
 	private volatile WatchService watchService;
 	private volatile Thread watcherThread;
 	private volatile boolean running;
+	private final AtomicBoolean starting = new AtomicBoolean();
 
 	private static final PomFileWatcher INSTANCE = new PomFileWatcher();
 
@@ -31,23 +33,31 @@ public class PomFileWatcher {
 		return INSTANCE;
 	}
 
-	/**
-	 * Starts the file watcher. Schedules an initial sync check after a delay, then
-	 * begins watching the POM file for changes.
-	 */
 	public void start() {
+		if (running || !starting.compareAndSet(false, true)) {
+			return;
+		}
 		Job initJob = new Job("BlueMind POM Sync Init") {
 			@Override
 			protected IStatus run(IProgressMonitor monitor) {
-				// Initial sync check
-				PomSyncChecker.checkAndPrompt(false);
+				if (!starting.get()) {
+					return Status.CANCEL_STATUS;
+				}
+				try {
+					PomSyncChecker.checkAndPrompt(false);
 
-				// Start watching
-				var pomPathOpt = PomPropertyReader.findGlobalPom();
-				if (pomPathOpt.isPresent()) {
-					startWatching(pomPathOpt.get());
-				} else {
-					LOG.info("No BlueMind global POM found, file watcher not started");
+					if (starting.get()) {
+						var pomPathOpt = PomPropertyReader.findGlobalPom();
+						if (pomPathOpt.isPresent()) {
+							startWatching(pomPathOpt.get());
+						} else {
+							LOG.info("No BlueMind global POM found, file watcher not started");
+						}
+					}
+				} finally {
+					if (!running) {
+						starting.set(false);
+					}
 				}
 				return Status.OK_STATUS;
 			}
@@ -56,20 +66,19 @@ public class PomFileWatcher {
 		initJob.schedule(STARTUP_DELAY_MS);
 	}
 
-	/**
-	 * Stops the file watcher and cleans up resources.
-	 */
 	public void stop() {
 		running = false;
+		starting.set(false);
 		try {
 			if (watchService != null) {
 				watchService.close();
+				watchService = null;
 			}
-		} catch (Exception e) {
-			// ignore on shutdown
+		} catch (Exception ignored) {
 		}
 		if (watcherThread != null) {
 			watcherThread.interrupt();
+			watcherThread = null;
 		}
 	}
 
@@ -118,10 +127,9 @@ public class PomFileWatcher {
 					LOG.info("POM file changed, checking sync...");
 					PomSyncChecker.checkAndPrompt(false);
 				}
-			} catch (ClosedWatchServiceException e) {
-				// Normal shutdown
+			} catch (ClosedWatchServiceException ignored) {
 				break;
-			} catch (InterruptedException e) {
+			} catch (InterruptedException ignored) {
 				Thread.currentThread().interrupt();
 				break;
 			} catch (Exception e) {

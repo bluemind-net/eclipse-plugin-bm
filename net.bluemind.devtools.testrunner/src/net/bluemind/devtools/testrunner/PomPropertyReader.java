@@ -22,7 +22,12 @@ public class PomPropertyReader {
 	private static final ILog LOG = Platform.getLog(PomPropertyReader.class);
 	private static volatile Path cachedPomPath;
 
-	public record PomProperties(String dockerDevenvTag, String targetPlatformVersion, String resolvedTestArgLine) {
+	public record PomProperties(String dockerDevenvTag, String targetPlatformVersion,
+			String targetRepoUrl, String resolvedTestArgLine) {
+
+		public boolean isFileTarget() {
+			return targetRepoUrl != null && targetRepoUrl.startsWith("file:");
+		}
 	}
 
 	/**
@@ -80,11 +85,15 @@ public class PomPropertyReader {
 			String targetVersion = getChildText(propsEl, "target-platform-version");
 			String testArgLine = getChildText(propsEl, "tycho.testArgLine");
 
-			if (dockerTag == null || targetVersion == null || testArgLine == null) {
+			if (dockerTag == null || testArgLine == null) {
 				LOG.warn("Missing required properties in POM: docker.devenv.tag=" + dockerTag
-						+ ", target-platform-version=" + targetVersion
 						+ ", tycho.testArgLine=" + (testArgLine != null ? "present" : "null"));
 				return Optional.empty();
+			}
+
+			String targetRepoUrl = findBluemindDepsRepoUrl(doc);
+			if (targetRepoUrl != null && targetVersion != null) {
+				targetRepoUrl = targetRepoUrl.replace("${target-platform-version}", targetVersion);
 			}
 
 			String resolved = testArgLine.replace("${docker.devenv.tag}", dockerTag);
@@ -92,11 +101,26 @@ public class PomPropertyReader {
 			if (!localOpts.isEmpty()) {
 				resolved = resolved + " " + localOpts;
 			}
-			return Optional.of(new PomProperties(dockerTag, targetVersion, resolved));
+			return Optional.of(new PomProperties(dockerTag, targetVersion, targetRepoUrl, resolved));
 		} catch (Exception e) {
 			LOG.error("Failed to parse POM: " + pomPath, e);
 			return Optional.empty();
 		}
+	}
+
+	private static String findBluemindDepsRepoUrl(Document doc) {
+		NodeList repos = doc.getElementsByTagName("repository");
+		for (int i = 0; i < repos.getLength(); i++) {
+			if (!(repos.item(i) instanceof Element repo)) {
+				continue;
+			}
+			String id = getChildText(repo, "id");
+			String layout = getChildText(repo, "layout");
+			if ("bluemind-deps".equals(id) && "p2".equals(layout)) {
+				return getChildText(repo, "url");
+			}
+		}
+		return null;
 	}
 
 	private static String getChildText(Element parent, String tagName) {
