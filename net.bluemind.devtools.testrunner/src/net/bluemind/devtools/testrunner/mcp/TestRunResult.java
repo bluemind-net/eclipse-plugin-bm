@@ -1,5 +1,6 @@
 package net.bluemind.devtools.testrunner.mcp;
 
+import java.nio.file.Path;
 import java.util.List;
 
 public record TestRunResult(
@@ -11,8 +12,12 @@ public record TestRunResult(
 		int ignored,
 		long durationMs,
 		List<TestFailure> failures,
-		String stdout,
-		String stderr) {
+		Path runDir,
+		Path stdoutFile,
+		Path stderrFile,
+		Path failuresFile,
+		long stdoutBytes,
+		long stderrBytes) {
 
 	public record TestFailure(String className, String methodName, boolean error, String trace) {
 	}

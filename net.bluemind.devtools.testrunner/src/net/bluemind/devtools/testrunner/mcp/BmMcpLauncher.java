@@ -1,5 +1,11 @@
 package net.bluemind.devtools.testrunner.mcp;
 
+import java.io.BufferedWriter;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -9,6 +15,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 import org.eclipse.core.runtime.CoreException;
 import org.eclipse.core.runtime.ILog;
@@ -115,7 +122,7 @@ public final class BmMcpLauncher {
 
 	public CompletableFuture<TestRunResult> runProject(IJavaProject project, String mode, long timeoutMs) {
 		ensureStarted();
-		Pending p = beginRun();
+		Pending p = beginRun(project.getElementName());
 		try {
 			BmTestLaunchShortcut.launchProject(project, mode, p.id);
 		} catch (RuntimeException e) {
@@ -135,7 +142,8 @@ public final class BmMcpLauncher {
 	private CompletableFuture<TestRunResult> runTypeOrMethod(IType type, String methodName, String mode,
 			long timeoutMs) {
 		ensureStarted();
-		Pending p = beginRun();
+		String slug = type.getElementName() + (methodName != null ? "#" + methodName : "");
+		Pending p = beginRun(slug);
 		try {
 			BmTestLaunchShortcut.launchElement(type, methodName, mode, p.id);
 		} catch (RuntimeException e) {
@@ -144,17 +152,24 @@ public final class BmMcpLauncher {
 		return withTimeout(p, timeoutMs);
 	}
 
-	private synchronized Pending beginRun() {
+	private synchronized Pending beginRun(String slug) {
 		if (active != null && !active.future.isDone()) {
 			throw new IllegalStateException("Another MCP-triggered test run is already active. "
 					+ "Tool calls are serialized; wait for the previous run to finish.");
 		}
-		Pending p = new Pending(UUID.randomUUID().toString());
+		Pending p;
+		try {
+			Path dir = BmMcpRunStore.allocate(slug);
+			p = new Pending(UUID.randomUUID().toString(), dir);
+		} catch (IOException e) {
+			throw new IllegalStateException("Could not allocate run directory: " + e.getMessage(), e);
+		}
 		active = p;
 		return p;
 	}
 
 	private void failAndClear(Pending p, Throwable e) {
+		closeQuiet(p);
 		p.future.completeExceptionally(e);
 		if (active == p) {
 			active = null;
@@ -163,6 +178,9 @@ public final class BmMcpLauncher {
 
 	private CompletableFuture<TestRunResult> withTimeout(Pending p, long timeoutMs) {
 		return p.future.orTimeout(timeoutMs, TimeUnit.MILLISECONDS).whenComplete((r, err) -> {
+			if (err != null) {
+				closeQuiet(p);
+			}
 			if (active == p) {
 				active = null;
 			}
@@ -214,22 +232,24 @@ public final class BmMcpLauncher {
 	}
 
 	private void appendStdout(Pending p, String text) {
-		synchronized (p.stdout) {
-			int room = MAX_STREAM_BYTES - p.stdout.length();
-			if (room <= 0) {
-				return;
-			}
-			p.stdout.append(text, 0, Math.min(text.length(), room));
-		}
+		writeStream(p.stdoutWriter, p.stdoutBytes, text);
 	}
 
 	private void appendStderr(Pending p, String text) {
-		synchronized (p.stderr) {
-			int room = MAX_STREAM_BYTES - p.stderr.length();
-			if (room <= 0) {
-				return;
+		writeStream(p.stderrWriter, p.stderrBytes, text);
+	}
+
+	private void writeStream(BufferedWriter writer, AtomicLong counter, String text) {
+		if (writer == null || text == null || text.isEmpty()) {
+			return;
+		}
+		synchronized (writer) {
+			try {
+				writer.write(text);
+				counter.addAndGet(text.getBytes(StandardCharsets.UTF_8).length);
+			} catch (IOException e) {
+				LOG.warn("Stream write failed: " + e.getMessage());
 			}
-			p.stderr.append(text, 0, Math.min(text.length(), room));
 		}
 	}
 
@@ -244,16 +264,38 @@ public final class BmMcpLauncher {
 		int errored = p.errored.get();
 		int ignored = p.ignored.get();
 		boolean success = failed == 0 && errored == 0 && total > 0;
-		TestRunResult result;
-		synchronized (p.stdout) {
-			synchronized (p.stderr) {
-				result = new TestRunResult(success, total, passed, failed, errored, ignored, dur,
-						List.copyOf(p.failures), p.stdout.toString(), p.stderr.toString());
-			}
-		}
+		List<TestRunResult.TestFailure> snapshot = List.copyOf(p.failures);
+		closeQuiet(p);
+		Path failuresFile = writeFailuresFile(p.runDir, snapshot);
+		TestRunResult result = new TestRunResult(success, total, passed, failed, errored, ignored, dur,
+				snapshot, p.runDir, p.stdoutFile, p.stderrFile, failuresFile,
+				p.stdoutBytes.get(), p.stderrBytes.get());
 		p.future.complete(result);
 		if (active == p) {
 			active = null;
+		}
+	}
+
+	private Path writeFailuresFile(Path runDir, List<TestRunResult.TestFailure> failures) {
+		if (failures.isEmpty()) {
+			return null;
+		}
+		Path target = runDir.resolve("failures.md");
+		StringBuilder sb = new StringBuilder();
+		for (var f : failures) {
+			sb.append("## ").append(f.error() ? "[ERROR] " : "[FAIL] ")
+					.append(f.className() == null ? "?" : f.className()).append("#")
+					.append(f.methodName() == null ? "?" : f.methodName()).append("\n\n");
+			sb.append("```\n");
+			sb.append(f.trace() == null ? "(no trace)" : f.trace().trim());
+			sb.append("\n```\n\n");
+		}
+		try {
+			Files.writeString(target, sb.toString(), StandardCharsets.UTF_8);
+			return target;
+		} catch (IOException e) {
+			LOG.warn("Could not write failures.md: " + e.getMessage());
+			return null;
 		}
 	}
 
@@ -275,10 +317,33 @@ public final class BmMcpLauncher {
 		return new TestRunResult.TestFailure(cls, method, error, trace);
 	}
 
-	private static final int MAX_STREAM_BYTES = 256 * 1024;
+	private static void closeQuiet(Pending p) {
+		close(p.stdoutWriter);
+		close(p.stderrWriter);
+	}
+
+	private static void close(BufferedWriter w) {
+		if (w == null) {
+			return;
+		}
+		synchronized (w) {
+			try {
+				w.flush();
+				w.close();
+			} catch (IOException ignored) {
+			}
+		}
+	}
 
 	private static final class Pending {
 		final String id;
+		final Path runDir;
+		final Path stdoutFile;
+		final Path stderrFile;
+		final BufferedWriter stdoutWriter;
+		final BufferedWriter stderrWriter;
+		final AtomicLong stdoutBytes = new AtomicLong();
+		final AtomicLong stderrBytes = new AtomicLong();
 		final long startedAt = System.currentTimeMillis();
 		final CompletableFuture<TestRunResult> future = new CompletableFuture<>();
 		final AtomicInteger total = new AtomicInteger();
@@ -287,12 +352,21 @@ public final class BmMcpLauncher {
 		final AtomicInteger errored = new AtomicInteger();
 		final AtomicInteger ignored = new AtomicInteger();
 		final List<TestRunResult.TestFailure> failures = Collections.synchronizedList(new ArrayList<>());
-		final StringBuilder stdout = new StringBuilder();
-		final StringBuilder stderr = new StringBuilder();
 		final Set<IProcess> processes = Collections.newSetFromMap(new ConcurrentHashMap<>());
 
-		Pending(String id) {
+		Pending(String id, Path runDir) {
 			this.id = id;
+			this.runDir = runDir;
+			this.stdoutFile = runDir.resolve("stdout.log");
+			this.stderrFile = runDir.resolve("stderr.log");
+			try {
+				this.stdoutWriter = Files.newBufferedWriter(stdoutFile, StandardCharsets.UTF_8,
+						StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+				this.stderrWriter = Files.newBufferedWriter(stderrFile, StandardCharsets.UTF_8,
+						StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+			} catch (IOException e) {
+				throw new IllegalStateException("Could not open stream files in " + runDir, e);
+			}
 		}
 	}
 }

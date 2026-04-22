@@ -92,11 +92,21 @@ Pour lancer un BM Plugin Test dans l'Eclipse qui tourne avec le plugin BM Test R
      }' | jq -r '.result.content[0].text'
    ```
 
-4. Le résultat est du markdown déjà formaté avec :
+4. Le résultat est un **résumé court** (markdown) :
    - Status PASSED / FAILED
    - Compteurs (total/passed/failed/errored/ignored) et durée
-   - Stacktraces des échecs
-   - stdout / stderr tronqués (derniers 32 Ko)
+   - Liste des failures (class#method, sans stacktrace)
+   - **Chemins vers les artefacts locaux** : `stdout.log`, `stderr.log`, `failures.md`
+     sous `~/.cache/bluemind/mcp/runs/<horodatage>-<slug>/`
+   - Les 50 derniers runs sont conservés, les plus anciens sont purgés automatiquement
+
+5. Si le résumé ne suffit pas, lire les artefacts localement :
+   ```bash
+   cat ~/.cache/bluemind/mcp/runs/<dir>/failures.md   # traces des échecs
+   tail -n 500 ~/.cache/bluemind/mcp/runs/<dir>/stderr.log
+   grep -n ERROR ~/.cache/bluemind/mcp/runs/<dir>/stdout.log
+   ```
+   → ça évite de faire transiter des centaines de Ko via la réponse MCP.
 
 Ne pas lancer plusieurs tools/call en parallèle — le serveur sérialise les runs et renvoie
 une erreur si un run est déjà actif.

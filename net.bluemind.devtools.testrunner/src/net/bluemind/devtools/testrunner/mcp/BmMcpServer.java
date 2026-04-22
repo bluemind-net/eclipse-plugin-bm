@@ -58,6 +58,7 @@ public final class BmMcpServer {
 		});
 		server.start();
 		BmMcpLauncher.instance().ensureStarted();
+		BmMcpRunStore.prune();
 		LOG.info("BM MCP server listening on http://127.0.0.1:" + port + "/mcp");
 	}
 
@@ -279,42 +280,44 @@ public final class BmMcpServer {
 		} else {
 			target = String.valueOf(args.get("project"));
 		}
-		sb.append("# BM Plugin Tests — ").append(target).append("\n\n");
-		sb.append("Status: **").append(r.success() ? "PASSED" : "FAILED").append("**\n");
+		sb.append("# BM Plugin Tests — ").append(target).append(" — ")
+				.append(r.success() ? "PASSED" : "FAILED").append("\n\n");
 		sb.append("Total: ").append(r.total())
 				.append(" | Passed: ").append(r.passed())
 				.append(" | Failed: ").append(r.failed())
 				.append(" | Errored: ").append(r.errored())
 				.append(" | Ignored: ").append(r.ignored()).append("\n");
-		sb.append("Duration: ").append(formatDuration(r.durationMs())).append("\n");
-		if (!r.failures().isEmpty()) {
-			sb.append("\n## Failures\n\n");
-			for (var f : r.failures()) {
-				sb.append("### ").append(f.error() ? "[ERROR] " : "[FAIL] ")
-						.append(f.className()).append("#").append(f.methodName()).append("\n\n");
-				sb.append("```\n");
-				sb.append(f.trace() == null ? "(no trace)" : f.trace().trim());
-				sb.append("\n```\n\n");
-			}
-		}
-		appendStreamBlock(sb, "stdout", r.stdout());
-		appendStreamBlock(sb, "stderr", r.stderr());
-		return sb.toString();
-	}
+		sb.append("Duration: ").append(formatDuration(r.durationMs())).append("\n\n");
 
-	private void appendStreamBlock(StringBuilder sb, String name, String text) {
-		if (text == null || text.isEmpty()) {
-			return;
-		}
-		sb.append("\n## ").append(name).append("\n\n```\n");
-		String trimmed = text.length() > 32_000
-				? "...(truncated, kept last 32000 chars)...\n" + text.substring(text.length() - 32_000)
-				: text;
-		sb.append(trimmed);
-		if (!trimmed.endsWith("\n")) {
+		if (!r.failures().isEmpty()) {
+			sb.append("## Failures (").append(r.failures().size()).append(")\n\n");
+			int cap = 50;
+			int shown = 0;
+			for (var f : r.failures()) {
+				if (shown++ >= cap) {
+					sb.append("- ... ").append(r.failures().size() - cap)
+							.append(" more (see failures.md)\n");
+					break;
+				}
+				sb.append("- ").append(f.error() ? "[ERROR] " : "[FAIL] ")
+						.append(f.className() == null ? "?" : f.className()).append("#")
+						.append(f.methodName() == null ? "?" : f.methodName()).append("\n");
+			}
 			sb.append('\n');
 		}
-		sb.append("```\n");
+
+		sb.append("## Artifacts\n\n");
+		if (r.failuresFile() != null) {
+			sb.append("- Failure traces: `").append(r.failuresFile()).append("`\n");
+		}
+		sb.append("- stdout (").append(BmMcpRunStore.humanSize(r.stdoutBytes())).append("): `")
+				.append(r.stdoutFile()).append("`\n");
+		sb.append("- stderr (").append(BmMcpRunStore.humanSize(r.stderrBytes())).append("): `")
+				.append(r.stderrFile()).append("`\n");
+		sb.append("- Run dir: `").append(r.runDir()).append("`\n\n");
+		sb.append("To inspect: `tail -n 200 '").append(r.stderrFile()).append("'` or `cat '")
+				.append(r.failuresFile() == null ? r.stdoutFile() : r.failuresFile()).append("'`.\n");
+		return sb.toString();
 	}
 
 	private static String formatDuration(long ms) {
