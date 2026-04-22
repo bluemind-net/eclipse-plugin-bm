@@ -19,6 +19,9 @@ public class BmTestLaunchShortcut extends JUnitWorkbenchLaunchShortcut {
 
 	private static final ILog LOG = Platform.getLog(BmTestLaunchShortcut.class);
 	private static final String BM_TEST_FEATURE = "net.bluemind.tests.feature:default";
+	public static final String MCP_REQUEST_ID_ATTR = "net.bluemind.devtools.testrunner.mcpRequestId";
+
+	private static final ThreadLocal<String> PENDING_MCP_ID = new ThreadLocal<>();
 
 	@Override
 	protected ILaunchConfigurationWorkingCopy createLaunchConfiguration(IJavaElement element) throws CoreException {
@@ -39,10 +42,19 @@ public class BmTestLaunchShortcut extends JUnitWorkbenchLaunchShortcut {
 		wc.setAttribute("product", "net.bluemind.application.launcher.bmProduct");
 		wc.setAttribute("useProduct", false);
 
+		String mcpId = PENDING_MCP_ID.get();
+		if (mcpId != null) {
+			wc.setAttribute(MCP_REQUEST_ID_ATTR, mcpId);
+		}
+
 		return wc;
 	}
 
 	public static void launchElement(IType type, String methodName, String mode) {
+		launchElement(type, methodName, mode, null);
+	}
+
+	public static void launchElement(IType type, String methodName, String mode, String mcpRequestId) {
 		try {
 			if (Flags.isAbstract(type.getFlags())) {
 				LOG.warn("Cannot run tests on abstract class: " + type.getFullyQualifiedName());
@@ -52,7 +64,21 @@ public class BmTestLaunchShortcut extends JUnitWorkbenchLaunchShortcut {
 			return;
 		}
 		IJavaElement element = methodName != null ? findTestMethod(type, methodName) : type;
-		new BmTestLaunchShortcut().launch(new StructuredSelection(element), mode);
+		PENDING_MCP_ID.set(mcpRequestId);
+		try {
+			new BmTestLaunchShortcut().launch(new StructuredSelection(element), mode);
+		} finally {
+			PENDING_MCP_ID.remove();
+		}
+	}
+
+	public static void launchProject(IJavaElement projectElement, String mode, String mcpRequestId) {
+		PENDING_MCP_ID.set(mcpRequestId);
+		try {
+			new BmTestLaunchShortcut().launch(new StructuredSelection(projectElement), mode);
+		} finally {
+			PENDING_MCP_ID.remove();
+		}
 	}
 
 	private static IJavaElement findTestMethod(IType type, String methodName) {
