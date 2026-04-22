@@ -63,7 +63,11 @@ Pour lancer un BM Plugin Test dans l'Eclipse qui tourne avec le plugin BM Test R
    tournent — choisir celui dont `workspace` correspond, ou celui dont `projects` contient
    le bundle concerné).
 
-3. Appeler l'un des 3 outils via JSON-RPC. Les noms d'outil :
+3. Appeler l'un des 4 outils via JSON-RPC. Les noms d'outil :
+   - `refresh_projects` — `{ "projects": ["net.bluemind.foo", "net.bluemind.foo.tests"] }`
+     → refresh filesystem + build incrémental + attend la fin des jobs, retourne les erreurs
+     de compil s'il y en a. **À appeler après chaque édition de fichier et avant un `run_*`**
+     pour garantir que les tests tournent avec le code compilé à jour.
    - `run_bundle_tests` — `{ "project": "net.bluemind.foo.tests", "mode": "run" }`
    - `run_class_tests`  — `{ "project": "...", "className": "net.bluemind.foo.tests.MyTest" }`
    - `run_test_method`  — `{ "project": "...", "className": "...", "methodName": "testFoo" }`
@@ -157,13 +161,20 @@ est plus simple et supporte naturellement le multi-Eclipse.
 
 ## 3. Surface d'outils
 
-| Tool              | Arguments                                        | Description                        |
-|-------------------|--------------------------------------------------|------------------------------------|
-| `run_bundle_tests`| `project` (+ `mode?`)                            | Tous les tests d'un bundle `*.tests` |
-| `run_class_tests` | `project`, `className` (FQN) (+ `mode?`)         | Tous les `@Test` d'une classe       |
-| `run_test_method` | `project`, `className`, `methodName` (+ `mode?`) | Une seule méthode `@Test`           |
+| Tool              | Arguments                                        | Description                                         |
+|-------------------|--------------------------------------------------|-----------------------------------------------------|
+| `refresh_projects`| `projects` (array)                               | Refresh + build + check compile errors              |
+| `run_bundle_tests`| `project` (+ `mode?`)                            | Tous les tests d'un bundle `*.tests`                |
+| `run_class_tests` | `project`, `className` (FQN) (+ `mode?`)         | Tous les `@Test` d'une classe                       |
+| `run_test_method` | `project`, `className`, `methodName` (+ `mode?`) | Une seule méthode `@Test`                           |
 
-Un `tools/call` bloque la réponse HTTP jusqu'à la fin du run (timeout interne 30 min).
+Un `tools/call` bloque la réponse HTTP jusqu'à la fin de l'opération (timeout interne 30 min
+pour les runs de test ; un refresh typique se mesure en secondes).
+
+**Workflow recommandé** : après chaque édition de fichier côté Claude Code, appeler
+`refresh_projects` avec la liste des bundles touchés avant le `run_*`. Ça garantit qu'Eclipse
+voit les changements disque et qu'un nouveau cycle de compil a eu lieu — sinon le launch peut
+tourner avec un `.class` obsolète.
 
 ## 4. Sécurité
 

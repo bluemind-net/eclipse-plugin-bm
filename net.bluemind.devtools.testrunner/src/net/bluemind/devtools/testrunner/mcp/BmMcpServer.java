@@ -230,6 +230,22 @@ public final class BmMcpServer {
 			return error(id, -32602, "Missing tool name");
 		}
 		Map<String, Object> args = (Map<String, Object>) params.getOrDefault("arguments", Map.of());
+
+		if (BmMcpTools.TOOL_REFRESH.equals(name)) {
+			try {
+				List<String> projects = BmMcpTools.asStringList(args.get("projects"));
+				if (projects.isEmpty()) {
+					return success(id, toolTextResult(
+							"Missing or empty 'projects' argument.", true));
+				}
+				BmMcpTools.RefreshResult rr = BmMcpTools.refreshProjects(projects);
+				return success(id, toolTextResult(rr.markdown(), !rr.ok()));
+			} catch (Exception e) {
+				LOG.error("refresh_projects error: " + e.getMessage(), e);
+				return success(id, toolTextResult("Refresh failed: " + e.getMessage(), true));
+			}
+		}
+
 		try {
 			CompletableFuture<TestRunResult> future = BmMcpTools.invoke(name, args, DEFAULT_TEST_TIMEOUT_MS);
 			TestRunResult result;
