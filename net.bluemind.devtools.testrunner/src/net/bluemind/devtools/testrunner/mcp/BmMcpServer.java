@@ -209,9 +209,11 @@ public final class BmMcpServer {
 		result.put("protocolVersion", PROTOCOL_VERSION);
 		result.put("capabilities", caps);
 		result.put("serverInfo", serverInfo);
-		result.put("instructions", "Triggers JUnit Plugin Tests in the running Eclipse instance. Tools: "
+		result.put("instructions", "Controls the running Eclipse instance for BlueMind development. Tools: "
 				+ String.join(", ", List.of(BmMcpTools.TOOL_RUN_BUNDLE, BmMcpTools.TOOL_RUN_CLASS,
-						BmMcpTools.TOOL_RUN_METHOD))
+						BmMcpTools.TOOL_RUN_METHOD, BmMcpTools.TOOL_REFRESH, BmMcpTools.TOOL_GET_PROBLEMS,
+						BmMcpTools.TOOL_CLEAN, BmMcpTools.TOOL_RELOAD_TARGET, BmMcpTools.TOOL_IMPORT_PROJECTS,
+						BmMcpTools.TOOL_OPEN_PROJECTS))
 				+ ".");
 		return result;
 	}
@@ -243,6 +245,18 @@ public final class BmMcpServer {
 			} catch (Exception e) {
 				LOG.error("refresh_projects error: " + e.getMessage(), e);
 				return success(id, toolTextResult("Refresh failed: " + e.getMessage(), true));
+			}
+		}
+
+		if (BmMcpTools.isTextTool(name)) {
+			try {
+				BmMcpTools.ToolResult tr = BmMcpTools.invokeText(name, args);
+				return success(id, toolTextResult(tr.markdown(), !tr.ok()));
+			} catch (IllegalArgumentException e) {
+				return success(id, toolTextResult(e.getMessage(), true));
+			} catch (Exception e) {
+				LOG.error(name + " error: " + e.getMessage(), e);
+				return success(id, toolTextResult(name + " failed: " + e.getMessage(), true));
 			}
 		}
 
