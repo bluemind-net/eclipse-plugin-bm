@@ -90,7 +90,7 @@
             name="BlueMind"/>
       <view
             id="net.bluemind.devtools.gitchanges.views.changedFiles"
-            name="Branch Changed Files"
+            name="Working Changes"
             category="net.bluemind.devtools.gitchanges.category"
             class="net.bluemind.devtools.gitchanges.views.ChangedFilesView"
             restorable="true"/>
@@ -113,7 +113,7 @@
       <menuContribution locationURI="toolbar:net.bluemind.devtools.gitchanges.views.changedFiles">
          <command
                commandId="net.bluemind.devtools.gitchanges.commands.refresh"
-               icon="platform:/plugin/org.eclipse.ui/icons/full/elcl16/refresh.png"
+               icon="platform:/plugin/org.eclipse.ui/icons/full/elcl16/refresh_nav.png"
                tooltip="Refresh"/>
       </menuContribution>
    </extension>

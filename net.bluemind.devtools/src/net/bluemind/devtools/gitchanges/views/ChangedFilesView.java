@@ -190,8 +190,8 @@ public class ChangedFilesView extends ViewPart {
         };
         setBranchAction.setToolTipText("Set the branch to compare against");
         setBranchAction.setImageDescriptor(
-            org.eclipse.ui.PlatformUI.getWorkbench().getSharedImages()
-                .getImageDescriptor(org.eclipse.ui.ISharedImages.IMG_OBJ_FOLDER));
+            org.eclipse.ui.plugin.AbstractUIPlugin.imageDescriptorFromPlugin(
+                "org.eclipse.egit.ui", "icons/obj16/branch_obj.png"));
         toolbar.add(setBranchAction);
         getViewSite().getActionBars().updateActionBars();
     }
