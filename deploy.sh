@@ -1,24 +1,45 @@
 #!/usr/bin/env bash
 # Quick local install: compile the bundle with javac against the running
-# Eclipse's plugins, package it, and drop it into ~/eclipse/dropins.
+# Eclipse's plugins, package it, and drop it into <eclipse>/dropins.
 # This bypasses the Tycho build (handy when mvn can't run locally).
-set -e
+#
+# Eclipse location is resolved from (first match wins):
+#   1. $ECLIPSE_HOME
+#   2. ./eclipse  (next to this script)
+#   3. $HOME/eclipse
+set -euo pipefail
 
-ECLIPSE=/home/alexandre/eclipse
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PLUGIN_DIR="$SCRIPT_DIR/net.bluemind.devtools"
+
+# Resolve the Eclipse installation.
+for cand in "${ECLIPSE_HOME:-}" "$SCRIPT_DIR/eclipse" "$HOME/eclipse"; do
+	if [ -n "$cand" ] && [ -d "$cand/plugins" ]; then
+		ECLIPSE="$cand"
+		break
+	fi
+done
+if [ -z "${ECLIPSE:-}" ]; then
+	echo "error: could not find an Eclipse install (set ECLIPSE_HOME=/path/to/eclipse)" >&2
+	exit 1
+fi
+
 ECLIPSE_PLUGINS="$ECLIPSE/plugins"
-PLUGIN_DIR=/home/alexandre/dev/eclipse-plugin-bm/net.bluemind.devtools
 SRC="$PLUGIN_DIR/src"
-OUT=/tmp/bm-devtools-build/bin
+BUILD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/bm-devtools-build.XXXXXX")"
+OUT="$BUILD_DIR/bin"
 OUT_JAR="$ECLIPSE/dropins/net.bluemind.devtools_1.4.0.jar"
+trap 'rm -rf "$BUILD_DIR"' EXIT
 
-rm -rf "$OUT" && mkdir -p "$OUT"
+mkdir -p "$OUT" "$ECLIPSE/dropins"
 
 # Classpath = every (non-source) jar shipped with this Eclipse.
-CP=$(find "$ECLIPSE_PLUGINS" -name "*.jar" ! -name "*.source_*" | tr '\n' ':')
+CP="$(find "$ECLIPSE_PLUGINS" -name '*.jar' ! -name '*.source_*' | tr '\n' ':')"
 
+echo "Eclipse:   $ECLIPSE"
 echo "Compiling (JavaSE-21)..."
-find "$SRC" -name "*.java" > /tmp/bm-devtools-build/srcs.txt
-javac --release 21 -cp "$CP" -d "$OUT" "@/tmp/bm-devtools-build/srcs.txt"
+find "$SRC" -name '*.java' > "$BUILD_DIR/srcs.txt"
+javac --release 21 -cp "$CP" -d "$OUT" "@$BUILD_DIR/srcs.txt"
 
 cp -r "$PLUGIN_DIR/icons" "$OUT/"
 cp "$PLUGIN_DIR/plugin.xml" "$OUT/"
