@@ -142,10 +142,15 @@ public class PomSyncChecker {
 		PomProperties pom = pomPropsOpt.get();
 		WorkspaceConfig ws = wsConfigOpt.get();
 
-		boolean vmMismatch = !normalize(pom.resolvedTestArgLine()).equals(normalize(ws.vmArgs()));
+		var prefs = Activator.getDefault().getPreferenceStore();
+		boolean jreSyncEnabled = prefs.getBoolean(Activator.PREF_POM_WATCH_JRE);
+		boolean targetSyncEnabled = prefs.getBoolean(Activator.PREF_POM_WATCH_TARGET);
+
+		boolean vmMismatch = jreSyncEnabled
+				&& !normalize(pom.resolvedTestArgLine()).equals(normalize(ws.vmArgs()));
 
 		boolean targetMismatch;
-		if (pom.targetRepoUrl() == null) {
+		if (!targetSyncEnabled || pom.targetRepoUrl() == null) {
 			targetMismatch = false;
 		} else {
 			BmLocationInfo current = ws.bmLocation();

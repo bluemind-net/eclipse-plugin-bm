@@ -15,6 +15,8 @@ public class Activator extends AbstractUIPlugin {
 
 	public static final String PLUGIN_ID = "net.bluemind.devtools";
 	public static final String PREF_MCP_ENABLED = "mcp.enabled";
+	public static final String PREF_POM_WATCH_JRE = "pomWatcher.jre.enabled";
+	public static final String PREF_POM_WATCH_TARGET = "pomWatcher.target.enabled";
 
 	/** Status icons used by the Branch Changed Files view, preloaded into the image registry. */
 	private static final String[] STATUS_ICONS = { "modified", "added", "deleted", "renamed", "copied" };
@@ -35,11 +37,11 @@ public class Activator extends AbstractUIPlugin {
 		BmContext.instance().initialize();
 
 		getPreferenceStore().setDefault("codeMining.enabled", false);
-		getPreferenceStore().setDefault("pomWatcher.enabled", true);
+		getPreferenceStore().setDefault(PREF_POM_WATCH_JRE, true);
+		getPreferenceStore().setDefault(PREF_POM_WATCH_TARGET, true);
 		getPreferenceStore().setDefault(PREF_MCP_ENABLED, true);
 
-		if (getPreferenceStore().getBoolean("pomWatcher.enabled")
-				&& BmContext.instance().hasGlobalPom()) {
+		if (isPomWatchEnabled() && BmContext.instance().hasGlobalPom()) {
 			PomFileWatcher.instance().start();
 		}
 
@@ -48,11 +50,11 @@ public class Activator extends AbstractUIPlugin {
 		}
 
 		prefListener = event -> {
-			if ("pomWatcher.enabled".equals(event.getProperty())) {
-				boolean enabled = getPreferenceStore().getBoolean("pomWatcher.enabled");
-				if (enabled && BmContext.instance().hasGlobalPom()) {
+			if (PREF_POM_WATCH_JRE.equals(event.getProperty())
+					|| PREF_POM_WATCH_TARGET.equals(event.getProperty())) {
+				if (isPomWatchEnabled() && BmContext.instance().hasGlobalPom()) {
 					PomFileWatcher.instance().start();
-				} else if (!enabled) {
+				} else if (!isPomWatchEnabled()) {
 					PomFileWatcher.instance().stop();
 				}
 			} else if (PREF_MCP_ENABLED.equals(event.getProperty())) {
@@ -86,6 +88,12 @@ public class Activator extends AbstractUIPlugin {
 
 	public synchronized BmMcpServer getMcpServer() {
 		return mcpServer;
+	}
+
+	/** The POM watcher runs when either the JRE-args or target-platform sync is enabled. */
+	public boolean isPomWatchEnabled() {
+		return getPreferenceStore().getBoolean(PREF_POM_WATCH_JRE)
+				|| getPreferenceStore().getBoolean(PREF_POM_WATCH_TARGET);
 	}
 
 	private void preloadStatusIcons() {

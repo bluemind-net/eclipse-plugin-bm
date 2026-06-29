@@ -23,8 +23,10 @@ public class BmPreferencePage extends FieldEditorPreferencePage implements IWork
 	protected void createFieldEditors() {
 		addField(new BooleanFieldEditor("codeMining.enabled",
 				"Show Run/Debug code mining above test methods", getFieldEditorParent()));
-		addField(new BooleanFieldEditor("pomWatcher.enabled",
-				"Automatically watch POM file for changes", getFieldEditorParent()));
+		addField(new BooleanFieldEditor(Activator.PREF_POM_WATCH_JRE,
+				"Watch POM & sync JRE arguments", getFieldEditorParent()));
+		addField(new BooleanFieldEditor(Activator.PREF_POM_WATCH_TARGET,
+				"Watch POM & sync target platform", getFieldEditorParent()));
 		addField(new BooleanFieldEditor(Activator.PREF_MCP_ENABLED,
 				"Enable MCP server for Claude Code (writes ~/.config/bluemind/mcp.json)",
 				getFieldEditorParent()));
