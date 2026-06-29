@@ -24,5 +24,6 @@ Require-Bundle: org.eclipse.core.runtime,
  org.eclipse.equinox.p2.core,
  org.eclipse.equinox.p2.metadata,
  org.eclipse.equinox.p2.repository
+Import-Package: com.sun.net.httpserver
 Bundle-RequiredExecutionEnvironment: JavaSE-21
 Bundle-ActivationPolicy: lazy

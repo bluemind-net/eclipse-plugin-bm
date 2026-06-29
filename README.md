@@ -1,9 +1,10 @@
 # BM Test Runner — Plugin Eclipse
 
-Plugin Eclipse pour le développement BlueMind. Il fournit deux fonctionnalités :
+Plugin Eclipse pour le développement BlueMind. Il fournit trois fonctionnalités :
 
 - **Lancement rapide des tests** : clic droit sur un projet `*.tests` pour lancer les JUnit Plugin Tests avec une configuration préconfigurée.
 - **Synchronisation POM → workspace** : détecte automatiquement les changements dans `open/global/pom.xml` (via inotify) et propose de mettre à jour la configuration Eclipse en conséquence.
+- **Serveur MCP pour Claude Code** : expose un endpoint HTTP JSON-RPC local (loopback + token) permettant à Claude Code de déclencher des tests dans l'Eclipse qui tourne et de récupérer stdout/stderr + outcome. Voir [docs/CLAUDE_CODE_MCP.md](net.bluemind.devtools.testrunner/docs/CLAUDE_CODE_MCP.md).
 
 ## Installation
 

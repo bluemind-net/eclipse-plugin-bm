@@ -80,4 +80,8 @@
       </menuContribution>
    </extension>
 
+   <extension point="org.eclipse.ui.startup">
+      <startup class="net.bluemind.devtools.testrunner.EarlyStartup"/>
+   </extension>
+
 </plugin>

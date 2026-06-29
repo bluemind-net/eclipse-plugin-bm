@@ -1,7 +1,10 @@
 package net.bluemind.devtools.testrunner;
 
+import java.util.LinkedHashSet;
 import java.util.Set;
 import java.util.jar.Manifest;
+
+import javax.xml.parsers.DocumentBuilderFactory;
 
 import org.eclipse.core.resources.IProject;
 import org.eclipse.core.runtime.CoreException;
@@ -14,11 +17,17 @@ import org.eclipse.jdt.core.IType;
 import org.eclipse.jdt.core.JavaModelException;
 import org.eclipse.jface.viewers.StructuredSelection;
 import org.eclipse.pde.ui.launcher.JUnitWorkbenchLaunchShortcut;
+import org.w3c.dom.Element;
+import org.w3c.dom.Node;
+import org.w3c.dom.NodeList;
 
 public class BmTestLaunchShortcut extends JUnitWorkbenchLaunchShortcut {
 
 	private static final ILog LOG = Platform.getLog(BmTestLaunchShortcut.class);
 	private static final String BM_TEST_FEATURE = "net.bluemind.tests.feature:default";
+	public static final String MCP_REQUEST_ID_ATTR = "net.bluemind.devtools.testrunner.mcpRequestId";
+
+	private static final ThreadLocal<String> PENDING_MCP_ID = new ThreadLocal<>();
 
 	@Override
 	protected ILaunchConfigurationWorkingCopy createLaunchConfiguration(IJavaElement element) throws CoreException {
@@ -28,7 +37,7 @@ public class BmTestLaunchShortcut extends JUnitWorkbenchLaunchShortcut {
 		var info = readBundleInfo(project);
 
 		wc.setAttribute("useCustomFeatures", true);
-		wc.setAttribute("selected_features", Set.of(BM_TEST_FEATURE));
+		wc.setAttribute("selected_features", buildSelectedFeatures(project));
 		wc.setAttribute("additional_plugins", buildAdditionalPlugins(info));
 
 		wc.setAttribute("featureDefaultLocation", "workspace");
@@ -39,10 +48,19 @@ public class BmTestLaunchShortcut extends JUnitWorkbenchLaunchShortcut {
 		wc.setAttribute("product", "net.bluemind.application.launcher.bmProduct");
 		wc.setAttribute("useProduct", false);
 
+		String mcpId = PENDING_MCP_ID.get();
+		if (mcpId != null) {
+			wc.setAttribute(MCP_REQUEST_ID_ATTR, mcpId);
+		}
+
 		return wc;
 	}
 
 	public static void launchElement(IType type, String methodName, String mode) {
+		launchElement(type, methodName, mode, null);
+	}
+
+	public static void launchElement(IType type, String methodName, String mode, String mcpRequestId) {
 		try {
 			if (Flags.isAbstract(type.getFlags())) {
 				LOG.warn("Cannot run tests on abstract class: " + type.getFullyQualifiedName());
@@ -52,7 +70,21 @@ public class BmTestLaunchShortcut extends JUnitWorkbenchLaunchShortcut {
 			return;
 		}
 		IJavaElement element = methodName != null ? findTestMethod(type, methodName) : type;
-		new BmTestLaunchShortcut().launch(new StructuredSelection(element), mode);
+		PENDING_MCP_ID.set(mcpRequestId);
+		try {
+			new BmTestLaunchShortcut().launch(new StructuredSelection(element), mode);
+		} finally {
+			PENDING_MCP_ID.remove();
+		}
+	}
+
+	public static void launchProject(IJavaElement projectElement, String mode, String mcpRequestId) {
+		PENDING_MCP_ID.set(mcpRequestId);
+		try {
+			new BmTestLaunchShortcut().launch(new StructuredSelection(projectElement), mode);
+		} finally {
+			PENDING_MCP_ID.remove();
+		}
 	}
 
 	private static IJavaElement findTestMethod(IType type, String methodName) {
@@ -107,5 +139,51 @@ public class BmTestLaunchShortcut extends JUnitWorkbenchLaunchShortcut {
 			return Set.of(entry, host);
 		}
 		return Set.of(entry);
+	}
+
+	private Set<String> buildSelectedFeatures(IProject project) {
+		Set<String> features = new LinkedHashSet<>();
+		features.add(BM_TEST_FEATURE);
+		for (String id : readExtraFeatureRequirements(project)) {
+			features.add(id + ":default");
+		}
+		return features;
+	}
+
+	private Set<String> readExtraFeatureRequirements(IProject project) {
+		var pomFile = project.getFile("pom.xml");
+		if (!pomFile.exists()) {
+			return Set.of();
+		}
+		try (var is = pomFile.getContents()) {
+			var doc = DocumentBuilderFactory.newInstance().newDocumentBuilder().parse(is);
+			NodeList reqs = doc.getElementsByTagName("requirement");
+			Set<String> features = new LinkedHashSet<>();
+			for (int i = 0; i < reqs.getLength(); i++) {
+				if (!(reqs.item(i) instanceof Element req)) {
+					continue;
+				}
+				String type = childText(req, "type");
+				String id = childText(req, "id");
+				if ("eclipse-feature".equals(type) && id != null && !id.isEmpty()) {
+					features.add(id);
+				}
+			}
+			return features;
+		} catch (Exception e) {
+			LOG.warn("Could not read extraRequirements from pom.xml of " + project.getName() + ": " + e.getMessage());
+			return Set.of();
+		}
+	}
+
+	private static String childText(Element parent, String tagName) {
+		NodeList children = parent.getChildNodes();
+		for (int i = 0; i < children.getLength(); i++) {
+			Node child = children.item(i);
+			if (child instanceof Element el && el.getTagName().equals(tagName)) {
+				return el.getTextContent().trim();
+			}
+		}
+		return null;
 	}
 }
