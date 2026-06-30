@@ -1,11 +1,12 @@
 # BlueMind Developer Tools — Plugin Eclipse
 
-Plugin Eclipse pour le développement BlueMind. Il fournit quatre fonctionnalités :
+Plugin Eclipse pour le développement BlueMind. Il fournit cinq fonctionnalités :
 
 - **Lancement rapide des tests** : clic droit sur un projet `*.tests` pour lancer les JUnit Plugin Tests avec une configuration préconfigurée.
 - **Synchronisation POM → workspace** : détecte automatiquement les changements dans `open/global/pom.xml` (via inotify) et propose de mettre à jour la configuration Eclipse en conséquence.
 - **Serveur MCP pour Claude Code** : expose un endpoint HTTP JSON-RPC local (loopback + token) permettant à Claude Code de déclencher des tests dans l'Eclipse qui tourne et de récupérer stdout/stderr + outcome. Voir [docs/CLAUDE_CODE_MCP.md](net.bluemind.devtools/docs/CLAUDE_CODE_MCP.md).
 - **Vue « Branch Changed Files »** : liste les fichiers modifiés sur la branche courante par rapport au merge-base avec l'upstream (committed / staged / unstaged), avec ouverture du fichier ou de l'éditeur de comparaison. Menu *Window → Show View → BlueMind → Branch Changed Files*.
+- **Interactive Code Review (ICR)** : revue de code interactive native. On sélectionne du code dans un éditeur, *clic droit → Ask Claude (ICR)…* (ou `Ctrl+Alt+C`) pour poser une question ou demander une modification ; Claude (skill `/icr`) écoute via le serveur MCP, agit, et répond inline sous forme de fil de commentaires (glyphe `💬`). Voir [docs/CLAUDE_CODE_MCP.md](net.bluemind.devtools/docs/CLAUDE_CODE_MCP.md) §5.
 
 ## Installation
 
@@ -55,6 +56,35 @@ Format : une option par ligne, `#` pour les commentaires.
 -Xmx8g
 -agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:5005
 ```
+
+## Code Review interactif (ICR) — skill `/icr`
+
+La revue de code interactive est pilotée depuis Claude Code par la commande `/icr`. Cette commande
+est fournie dans ce dépôt : [`.claude/commands/icr.md`](.claude/commands/icr.md).
+
+### Mise en place
+
+1. **Activer le serveur MCP** : dans Eclipse, **Window → Preferences → BlueMind** → cocher
+   *« Enable MCP server for Claude Code »*. Le plugin écrit alors `~/.config/bluemind/mcp/eclipse-*.json`
+   (url + token loopback). `jq` doit être installé.
+2. **Installer la commande `/icr`** — copier le fichier à l'un de ces emplacements :
+   - **Globale** (toutes vos sessions Claude Code) : `~/.claude/commands/icr.md`
+     ```bash
+     mkdir -p ~/.claude/commands && cp .claude/commands/icr.md ~/.claude/commands/
+     ```
+   - **Par projet** : `<dépôt>/.claude/commands/icr.md` (p. ex. dans votre checkout
+     `bluemind-all`), pour la partager avec l'équipe via git.
+
+### Utilisation
+
+1. Lancer `/icr` dans Claude Code depuis le dépôt à relire (`/icr [--source <branche>] [--repo <chemin>]`).
+2. Dans Eclipse, sélectionner du code → *clic droit → Ask Claude (ICR)…* (ou `Ctrl+Alt+C`) pour poser
+   une question ou demander une modification. Claude répond inline (glyphe `💬`).
+3. La vue **Window → Show View → BlueMind → Code Review Conversations** liste tous les fils ouverts ;
+   un double-clic ouvre le fichier sur la ligne concernée.
+
+> La commande `/icr` est documentée pas à pas dans le fichier lui-même ; le détail du protocole MCP
+> est dans [docs/CLAUDE_CODE_MCP.md](net.bluemind.devtools/docs/CLAUDE_CODE_MCP.md) §5.
 
 ## Build local
 

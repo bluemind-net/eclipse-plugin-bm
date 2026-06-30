@@ -183,3 +183,29 @@ tourner avec un `.class` obsolète.
 - Fichier de config `chmod 600`.
 - Pas de chemin d'exécution arbitraire : seuls les 3 outils ci-dessus sont exposés, et chacun
   n'accepte que des noms de projet / classe / méthode — résolus via l'API workspace Eclipse.
+
+## 5. Interactive Code Review (ICR)
+
+Le même serveur MCP expose des outils pour la revue de code interactive **native dans Eclipse**.
+L'utilisateur sélectionne du code dans un éditeur, fait **clic droit → Ask Claude (ICR)…**
+(ou `Ctrl+Alt+C`) et saisit une question ou une demande de modification. Claude (le skill `/icr`)
+écoute via `icr_next`, agit (réponse et/ou édition de fichier) puis répond via `icr_reply` ;
+la réponse s'affiche inline dans Eclipse sous forme de fil de commentaires (glyphe `💬`).
+
+Contrairement aux runs de test, ici **c'est Eclipse qui produit les événements** et Claude qui les
+draine en long-poll : `icr_next` bloque ~25 s puis renvoie `{"status":"idle"}` si rien n'est arrivé,
+sinon `{"status":"thread","thread":{…}}`. Chaque outil renvoie son payload en **JSON** dans le
+contenu texte (parser avec `jq -r '.result.content[0].text' | jq …`).
+
+| Tool        | Arguments                | Description                                                    |
+|-------------|--------------------------|----------------------------------------------------------------|
+| `icr_start` | `source?`, `repo?`       | Démarre/reprend une session, active le menu, re-queue le pending|
+| `icr_list`  | —                        | Liste tous les fils (JSON) — catch-up après reconnexion        |
+| `icr_next`  | —                        | Long-poll du prochain fil à traiter (`idle` / `thread`)        |
+| `icr_reply` | `threadId`, `body`       | Poste la réponse de Claude (markdown rendu dans le popup)      |
+| `icr_stop`  | —                        | Termine la session (désactive le menu)                         |
+
+Le champ `thread` contient : `id`, `filePath` (relatif au workspace), `absolutePath`, `startLine`,
+`endLine`, `selectedText`, `body`, `status`, `replies[]` (conversation complète). Le skill `/icr`
+orchestre la boucle ; après une édition il appelle `refresh_projects` pour recompiler avant de
+répondre.

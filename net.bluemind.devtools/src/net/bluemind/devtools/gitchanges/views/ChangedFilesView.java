@@ -38,11 +38,15 @@ import org.eclipse.swt.widgets.Table;
 import org.eclipse.team.core.history.IFileRevision;
 import org.eclipse.ui.IEditorInput;
 import org.eclipse.ui.IEditorPart;
+import org.eclipse.ui.IPartListener2;
 import org.eclipse.ui.IWorkbenchPage;
+import org.eclipse.ui.IWorkbenchPart;
+import org.eclipse.ui.IWorkbenchPartReference;
 import org.eclipse.ui.IWorkbenchWindow;
 import org.eclipse.ui.PlatformUI;
 import org.eclipse.ui.part.FileEditorInput;
 import org.eclipse.ui.part.ViewPart;
+import org.eclipse.ui.texteditor.ITextEditor;
 import org.eclipse.compare.CompareUI;
 import org.eclipse.compare.ITypedElement;
 import org.eclipse.jface.action.Action;
@@ -52,6 +56,7 @@ import org.eclipse.jface.window.Window;
 
 import net.bluemind.devtools.Activator;
 import net.bluemind.devtools.gitchanges.git.MergeBaseDiffComputer;
+import net.bluemind.devtools.gitchanges.quickdiff.QuickDiffBaselineManager;
 import net.bluemind.devtools.gitchanges.model.ChangedFile;
 import net.bluemind.devtools.gitchanges.model.FileStatus;
 import net.bluemind.devtools.gitchanges.refresh.IndexDiffListener;
@@ -73,6 +78,13 @@ public class ChangedFilesView extends ViewPart {
 
     /** User-specified target branch, or null to auto-detect. */
     private String targetBranch = null;
+
+    /** Drives the editor QuickDiff change ruler from the selected reference branch. */
+    private final QuickDiffBaselineManager baselineManager = new QuickDiffBaselineManager();
+    /** True once the user has explicitly selected a reference branch; keeps the ruler in sync. */
+    private boolean quickDiffActive = false;
+    /** Applies the git QuickDiff ruler to text editors opened after activation. */
+    private IPartListener2 quickDiffPartListener;
 
     @Override
     public void createPartControl(Composite parent) {
@@ -184,6 +196,9 @@ public class ChangedFilesView extends ViewPart {
                 if (dialog.open() == Window.OK) {
                     String value = dialog.getValue().trim();
                     targetBranch = value.isEmpty() ? null : value;
+                    // Activate QuickDiff on explicit branch selection; the refresh job
+                    // then applies the baseline to open editors.
+                    quickDiffActive = true;
                     triggerRefresh();
                 }
             }
@@ -200,6 +215,27 @@ public class ChangedFilesView extends ViewPart {
         workspaceListener = new WorkspaceChangeListener(this::scheduleRefresh);
         ResourcesPlugin.getWorkspace().addResourceChangeListener(
             workspaceListener, IResourceChangeEvent.POST_CHANGE);
+
+        // Apply the git QuickDiff ruler to text editors opened after the user selects a branch.
+        quickDiffPartListener = new IPartListener2() {
+            @Override
+            public void partOpened(IWorkbenchPartReference ref) {
+                applyQuickDiffTo(ref);
+            }
+            @Override
+            public void partVisible(IWorkbenchPartReference ref) {
+                applyQuickDiffTo(ref);
+            }
+        };
+        getSite().getWorkbenchWindow().getPartService().addPartListener(quickDiffPartListener);
+    }
+
+    private void applyQuickDiffTo(IWorkbenchPartReference ref) {
+        if (!quickDiffActive) return;
+        IWorkbenchPart part = ref.getPart(false);
+        if (part instanceof ITextEditor editor) {
+            baselineManager.applyToEditor(editor, targetBranch);
+        }
     }
 
     private void scheduleRefresh() {
@@ -235,6 +271,11 @@ public class ChangedFilesView extends ViewPart {
             String label = (warning != null) ? warning : buildStatusLabel(files, computer, repo);
 
             updateUI(files, label);
+
+            // Keep the editor QuickDiff baseline in sync with the selected reference branch.
+            if (quickDiffActive) {
+                Display.getDefault().asyncExec(() -> baselineManager.apply(targetBranch));
+            }
             return Status.OK_STATUS;
         }
     }
@@ -504,6 +545,10 @@ public class ChangedFilesView extends ViewPart {
     @Override
     public void dispose() {
         ResourcesPlugin.getWorkspace().removeResourceChangeListener(workspaceListener);
+        if (quickDiffPartListener != null) {
+            getSite().getWorkbenchWindow().getPartService().removePartListener(quickDiffPartListener);
+            quickDiffPartListener = null;
+        }
         // Fix: remove each repo's own listener from its cache entry
         for (Map.Entry<Repository, IndexDiffCacheEntry> e : cacheEntries.entrySet()) {
             IndexDiffListener listener = indexListeners.get(e.getKey());

@@ -39,7 +39,7 @@ CP="$(find "$ECLIPSE_PLUGINS" -name '*.jar' ! -name '*.source_*' | tr '\n' ':')"
 echo "Eclipse:   $ECLIPSE"
 echo "Compiling (JavaSE-21)..."
 find "$SRC" -name '*.java' > "$BUILD_DIR/srcs.txt"
-javac --release 21 -cp "$CP" -d "$OUT" "@$BUILD_DIR/srcs.txt"
+javac --release 21 -encoding UTF-8 -cp "$CP" -d "$OUT" "@$BUILD_DIR/srcs.txt"
 
 cp -r "$PLUGIN_DIR/icons" "$OUT/"
 cp "$PLUGIN_DIR/plugin.xml" "$OUT/"
