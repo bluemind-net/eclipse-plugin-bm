@@ -1,0 +1,121 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<?eclipse version="3.4"?>
+<plugin>
+
+   <extension point="org.eclipse.debug.ui.launchShortcuts">
+      <shortcut
+            class="net.bluemind.devtools.testrunner.BmTestLaunchShortcut"
+            icon="platform:/plugin/org.eclipse.pde.ui/icons/obj16/julaunchpgn.png"
+            id="net.bluemind.devtools.testrunner.launchShortcut"
+            label="BM Plugin Tests"
+            modes="run,debug">
+         <contextualLaunch>
+            <enablement>
+               <with variable="selection">
+                  <count value="1"/>
+                  <iterate>
+                     <adapt type="org.eclipse.jdt.core.IJavaElement">
+                        <test property="net.bluemind.devtools.testrunner.isInTestProject"/>
+                        <test property="org.eclipse.jdt.junit.canLaunchAsJUnit" forcePluginActivation="true"/>
+                     </adapt>
+                  </iterate>
+               </with>
+            </enablement>
+         </contextualLaunch>
+         <configurationType id="org.eclipse.pde.ui.JunitLaunchConfig"/>
+      </shortcut>
+   </extension>
+
+   <extension point="org.eclipse.core.expressions.propertyTesters">
+      <propertyTester
+            id="net.bluemind.devtools.testrunner.testProjectTester"
+            type="org.eclipse.jdt.core.IJavaElement"
+            namespace="net.bluemind.devtools.testrunner"
+            properties="isInTestProject"
+            class="net.bluemind.devtools.testrunner.TestProjectTester"/>
+   </extension>
+
+   <extension point="org.eclipse.ui.workbench.texteditor.codeMiningProviders">
+      <codeMiningProvider
+            id="net.bluemind.devtools.testrunner.testCodeMining"
+            class="net.bluemind.devtools.testrunner.BmTestCodeMiningProvider">
+         <enabledWhen>
+            <with variable="editorInput">
+               <adapt type="org.eclipse.core.resources.IFile">
+                  <test property="org.eclipse.core.resources.extension" value="java"/>
+               </adapt>
+            </with>
+         </enabledWhen>
+      </codeMiningProvider>
+   </extension>
+
+   <extension point="org.eclipse.ui.preferencePages">
+      <page
+            id="net.bluemind.devtools.testrunner.preferences"
+            name="BlueMind"
+            class="net.bluemind.devtools.testrunner.BmPreferencePage"/>
+   </extension>
+
+   <extension point="org.eclipse.ui.commands">
+      <command
+            id="net.bluemind.devtools.testrunner.pomSync"
+            name="Check POM Sync"
+            description="Check if workspace settings match the BlueMind global POM"/>
+   </extension>
+
+   <extension point="org.eclipse.ui.handlers">
+      <handler
+            commandId="net.bluemind.devtools.testrunner.pomSync"
+            class="net.bluemind.devtools.testrunner.PomSyncHandler"/>
+   </extension>
+
+   <extension point="org.eclipse.ui.menus">
+      <menuContribution locationURI="menu:org.eclipse.ui.main.menu?after=additions">
+         <menu id="net.bluemind.devtools.menu" label="BlueMind">
+            <command
+                  commandId="net.bluemind.devtools.testrunner.pomSync"
+                  label="Check POM Sync..."
+                  style="push"/>
+         </menu>
+      </menuContribution>
+   </extension>
+
+   <extension point="org.eclipse.ui.startup">
+      <startup class="net.bluemind.devtools.testrunner.EarlyStartup"/>
+   </extension>
+
+   <extension point="org.eclipse.ui.views">
+      <category
+            id="net.bluemind.devtools.gitchanges.category"
+            name="BlueMind"/>
+      <view
+            id="net.bluemind.devtools.gitchanges.views.changedFiles"
+            name="Working Changes"
+            category="net.bluemind.devtools.gitchanges.category"
+            class="net.bluemind.devtools.gitchanges.views.ChangedFilesView"
+            restorable="true"/>
+   </extension>
+
+   <extension point="org.eclipse.ui.commands">
+      <command
+            id="net.bluemind.devtools.gitchanges.commands.refresh"
+            name="Refresh Changed Files"
+            description="Refresh the list of changed files"/>
+   </extension>
+
+   <extension point="org.eclipse.ui.handlers">
+      <handler
+            commandId="net.bluemind.devtools.gitchanges.commands.refresh"
+            class="net.bluemind.devtools.gitchanges.views.ChangedFilesView$RefreshHandler"/>
+   </extension>
+
+   <extension point="org.eclipse.ui.menus">
+      <menuContribution locationURI="toolbar:net.bluemind.devtools.gitchanges.views.changedFiles">
+         <command
+               commandId="net.bluemind.devtools.gitchanges.commands.refresh"
+               icon="platform:/plugin/org.eclipse.ui/icons/full/elcl16/refresh_nav.png"
+               tooltip="Refresh"/>
+      </menuContribution>
+   </extension>
+
+</plugin>

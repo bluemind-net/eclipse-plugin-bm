@@ -1,15 +1,16 @@
-# BM Test Runner — Plugin Eclipse
+# BlueMind Developer Tools — Plugin Eclipse
 
-Plugin Eclipse pour le développement BlueMind. Il fournit trois fonctionnalités :
+Plugin Eclipse pour le développement BlueMind. Il fournit quatre fonctionnalités :
 
 - **Lancement rapide des tests** : clic droit sur un projet `*.tests` pour lancer les JUnit Plugin Tests avec une configuration préconfigurée.
 - **Synchronisation POM → workspace** : détecte automatiquement les changements dans `open/global/pom.xml` (via inotify) et propose de mettre à jour la configuration Eclipse en conséquence.
-- **Serveur MCP pour Claude Code** : expose un endpoint HTTP JSON-RPC local (loopback + token) permettant à Claude Code de déclencher des tests dans l'Eclipse qui tourne et de récupérer stdout/stderr + outcome. Voir [docs/CLAUDE_CODE_MCP.md](net.bluemind.devtools.testrunner/docs/CLAUDE_CODE_MCP.md).
+- **Serveur MCP pour Claude Code** : expose un endpoint HTTP JSON-RPC local (loopback + token) permettant à Claude Code de déclencher des tests dans l'Eclipse qui tourne et de récupérer stdout/stderr + outcome. Voir [docs/CLAUDE_CODE_MCP.md](net.bluemind.devtools/docs/CLAUDE_CODE_MCP.md).
+- **Vue « Branch Changed Files »** : liste les fichiers modifiés sur la branche courante par rapport au merge-base avec l'upstream (committed / staged / unstaged), avec ouverture du fichier ou de l'éditeur de comparaison. Menu *Window → Show View → BlueMind → Branch Changed Files*.
 
 ## Installation
 
 1. **Help → Install New Software...**
-2. **Add...** → Name: `BM Test Runner`, Location: `https://bluemind-net.github.io/eclipse-plugin-bm/`
+2. **Add...** → Name: `BlueMind Developer Tools`, Location: `https://bluemind-net.github.io/eclipse-plugin-bm/`
 3. Cocher **BlueMind Developer Tools** → Finish
 4. Redémarrer Eclipse
 
@@ -63,4 +64,4 @@ Prérequis : Java 21+, Maven 3.9+
 mvn clean verify
 ```
 
-Le p2 repository est généré dans `net.bluemind.devtools.testrunner.site/target/repository/`.
+Le p2 repository est généré dans `net.bluemind.devtools.site/target/repository/`.

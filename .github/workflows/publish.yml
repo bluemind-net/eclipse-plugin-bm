@@ -27,12 +27,12 @@ jobs:
         run: mvn -B -ntp -nsu clean verify
 
       - name: Prepare Pages content
-        run: cp net.bluemind.devtools.testrunner.site/index.html net.bluemind.devtools.testrunner.site/target/repository/
+        run: cp net.bluemind.devtools.site/index.html net.bluemind.devtools.site/target/repository/
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v4
         with:
-          path: net.bluemind.devtools.testrunner.site/target/repository
+          path: net.bluemind.devtools.site/target/repository
 
   deploy:
     needs: build
