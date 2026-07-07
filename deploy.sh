@@ -28,7 +28,7 @@ ECLIPSE_PLUGINS="$ECLIPSE/plugins"
 SRC="$PLUGIN_DIR/src"
 BUILD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/bm-devtools-build.XXXXXX")"
 OUT="$BUILD_DIR/bin"
-OUT_JAR="$ECLIPSE/dropins/net.bluemind.devtools_1.4.0.jar"
+OUT_JAR="$ECLIPSE/dropins/net.bluemind.devtools_1.5.0.jar"
 trap 'rm -rf "$BUILD_DIR"' EXIT
 
 mkdir -p "$OUT" "$ECLIPSE/dropins"

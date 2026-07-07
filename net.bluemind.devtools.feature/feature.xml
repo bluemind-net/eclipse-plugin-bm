@@ -2,7 +2,7 @@
 <feature
       id="net.bluemind.devtools.feature"
       label="BlueMind Developer Tools"
-      version="1.4.0.qualifier"
+      version="1.5.0.qualifier"
       provider-name="BlueMind">
 
    <description>
