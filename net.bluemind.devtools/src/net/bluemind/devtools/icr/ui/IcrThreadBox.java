@@ -261,28 +261,6 @@ public class IcrThreadBox extends PopupDialog {
 		if (thread == null || browser == null || browser.isDisposed()) {
 			return;
 		}
-		StringBuilder body = new StringBuilder();
-		if (thread.selectedText() != null && !thread.selectedText().isBlank()) {
-			body.append("<div class=\"sel\">").append(MarkdownHtml.escape(thread.selectedText())).append("</div>");
-		}
-		appendMessage(body, IcrReply.AUTHOR_USER, "You", thread.body());
-		for (IcrReply reply : thread.replies()) {
-			String label = IcrReply.AUTHOR_CLAUDE.equals(reply.author()) ? "Claude" : "You";
-			appendMessage(body, reply.author(), label, reply.body());
-		}
-		if (thread.working()) {
-			body.append("<div class=\"msg claude working\">")
-					.append("<div class=\"author claude\">Claude</div>")
-					.append("<div class=\"typing\">⏳ working…</div></div>");
-		}
-		browser.setText(MarkdownHtml.document(body.toString()));
-	}
-
-	private static void appendMessage(StringBuilder out, String author, String label, String markdown) {
-		String cls = IcrReply.AUTHOR_CLAUDE.equals(author) ? "claude" : "user";
-		out.append("<div class=\"msg ").append(cls).append("\">")
-				.append("<div class=\"author ").append(cls).append("\">").append(label).append("</div>")
-				.append(MarkdownHtml.toHtml(markdown))
-				.append("</div>");
+		browser.setText(MarkdownHtml.document(IcrConversationHtml.bodyHtml(thread)));
 	}
 }

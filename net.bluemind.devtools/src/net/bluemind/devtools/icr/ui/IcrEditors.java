@@ -5,6 +5,7 @@ import org.eclipse.core.filebuffers.ITextFileBuffer;
 import org.eclipse.core.runtime.IPath;
 import org.eclipse.jface.text.IDocument;
 import org.eclipse.jface.text.ITextOperationTarget;
+import org.eclipse.jface.text.ITextViewer;
 import org.eclipse.jface.text.source.ISourceViewerExtension5;
 import org.eclipse.swt.widgets.Display;
 import org.eclipse.ui.IEditorPart;
@@ -38,6 +39,36 @@ public final class IcrEditors {
 		}
 		IPath location = buffer.getLocation();
 		return location == null ? null : location.makeAbsolute().toString();
+	}
+
+	/**
+	 * The {@link ITextViewer} of the open text editor backed by
+	 * {@code workspacePath}, or {@code null} if no such editor is currently open.
+	 * When the file is open in more than one editor/split, the first match found
+	 * is returned. Must be called on the UI thread.
+	 */
+	public static ITextViewer findViewer(String workspacePath) {
+		if (workspacePath == null || !PlatformUI.isWorkbenchRunning()) {
+			return null;
+		}
+		for (IWorkbenchWindow window : PlatformUI.getWorkbench().getWorkbenchWindows()) {
+			for (IWorkbenchPage page : window.getPages()) {
+				for (IEditorReference ref : page.getEditorReferences()) {
+					IEditorPart editor = ref.getEditor(false);
+					if (editor == null) {
+						continue;
+					}
+					Object target = editor.getAdapter(ITextOperationTarget.class);
+					if (!(target instanceof ITextViewer viewer)) {
+						continue;
+					}
+					if (workspacePath.equals(workspacePath(viewer.getDocument()))) {
+						return viewer;
+					}
+				}
+			}
+		}
+		return null;
 	}
 
 	/** Recompute code minings in all open text editors, on the UI thread. */

@@ -17,6 +17,7 @@ public class Activator extends AbstractUIPlugin {
 
 	public static final String PLUGIN_ID = "net.bluemind.devtools";
 	public static final String PREF_MCP_ENABLED = "mcp.enabled";
+	public static final String PREF_ICR_INLINE = "icr.inlinePresentation";
 	public static final String PREF_POM_WATCH_JRE = "pomWatcher.jre.enabled";
 	public static final String PREF_POM_WATCH_TARGET = "pomWatcher.target.enabled";
 
@@ -47,6 +48,7 @@ public class Activator extends AbstractUIPlugin {
 		getPreferenceStore().setDefault(PREF_POM_WATCH_JRE, true);
 		getPreferenceStore().setDefault(PREF_POM_WATCH_TARGET, true);
 		getPreferenceStore().setDefault(PREF_MCP_ENABLED, true);
+		getPreferenceStore().setDefault(PREF_ICR_INLINE, true);
 
 		if (isPomWatchEnabled() && BmContext.instance().hasGlobalPom()) {
 			PomFileWatcher.instance().start();

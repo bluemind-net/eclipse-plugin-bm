@@ -20,16 +20,19 @@ import org.eclipse.swt.widgets.Control;
 import org.eclipse.swt.widgets.Shell;
 import org.eclipse.ui.PlatformUI;
 
+import net.bluemind.devtools.Activator;
 import net.bluemind.devtools.icr.model.IcrReply;
 import net.bluemind.devtools.icr.model.IcrSessionStore;
 import net.bluemind.devtools.icr.model.IcrThread;
 
 /**
  * Renders one compact summary line per ICR thread above the anchored code:
- * {@code 💬 N messages — Claude: <snippet>  ✎}. Clicking it opens
- * {@link IcrThreadBox} with the full conversation and a reply field. (Eclipse
- * code minings collapse onto a single header line, so the conversation itself
- * lives in the box, not inline.) Active only while a session is running.
+ * {@code 💬 N messages — Claude: <snippet>  ✎}. Clicking it toggles the thread
+ * open: inline presentation (default, see {@link Activator#PREF_ICR_INLINE})
+ * expands a {@link IcrInlineChatOverlay} embedded between this summary line
+ * and the code, reserving space for it via blank {@link SpacerMining} rows;
+ * the legacy popup presentation opens {@link IcrThreadBox} instead. Active
+ * only while a session is running.
  */
 public class IcrCodeMiningProvider extends AbstractCodeMiningProvider {
 
@@ -54,6 +57,9 @@ public class IcrCodeMiningProvider extends AbstractCodeMiningProvider {
 			return CompletableFuture.completedFuture(Collections.emptyList());
 		}
 
+		boolean inline = Activator.getDefault().getPreferenceStore().getBoolean(Activator.PREF_ICR_INLINE);
+		IcrInlineChatManager manager = IcrInlineChatManager.instance();
+
 		List<ICodeMining> minings = new ArrayList<>();
 		for (IcrThread thread : store.threadsForFile(workspacePath)) {
 			int line = lineOf(thread, document);
@@ -61,7 +67,17 @@ public class IcrCodeMiningProvider extends AbstractCodeMiningProvider {
 				continue;
 			}
 			try {
-				minings.add(new LineMining(line, document, this, summary(thread), openAction(thread.id())));
+				int headerLine = headerLineOf(line, document);
+				if (inline && manager.isExpanded(thread.id())) {
+					int lineHeight = viewer.getTextWidget().getLineHeight();
+					int rows = IcrInlineChatOverlay.reservedLineCount(lineHeight);
+					// Added before the summary mining so the reserved blank rows sit
+					// above it, keeping the bubble line where it always is: immediately
+					// below the anchored code line.
+					minings.add(new SpacerMining(headerLine, document, this, rows));
+				}
+				minings.add(
+						new LineMining(headerLine, document, this, summary(thread), openAction(viewer, thread.id())));
 			} catch (BadLocationException e) {
 				// line scrolled out of range after edits — skip
 			}
@@ -106,7 +122,7 @@ public class IcrCodeMiningProvider extends AbstractCodeMiningProvider {
 	}
 
 	/** 0-based line for the thread: live anchor if available, else snapshot. */
-	private static int lineOf(IcrThread thread, IDocument document) {
+	static int lineOf(IcrThread thread, IDocument document) {
 		Position anchor = thread.anchor();
 		if (anchor != null && !anchor.isDeleted()) {
 			try {
@@ -122,6 +138,17 @@ public class IcrCodeMiningProvider extends AbstractCodeMiningProvider {
 		return line;
 	}
 
+	/**
+	 * 0-based line the summary/bubble mining (and, when expanded, its spacer
+	 * rows) attaches to: the line right after {@code anchorLine}, so
+	 * {@code LineHeaderCodeMining}'s "draws above its line" behaviour renders
+	 * them below the anchored code instead of above it. Falls back to
+	 * {@code anchorLine} itself when it is the document's last line.
+	 */
+	static int headerLineOf(int anchorLine, IDocument document) {
+		return Math.min(anchorLine + 1, document.getNumberOfLines() - 1);
+	}
+
 	private final class LineMining extends LineHeaderCodeMining {
 		LineMining(int line, IDocument document, IcrCodeMiningProvider provider, String label,
 				Consumer<MouseEvent> action) throws BadLocationException {
@@ -130,10 +157,37 @@ public class IcrCodeMiningProvider extends AbstractCodeMiningProvider {
 		}
 	}
 
-	private static Consumer<MouseEvent> openAction(String threadId) {
+	/**
+	 * A blank header mining reserving {@code rows} extra line-heights of
+	 * vertical space above the anchored code line, so
+	 * {@link IcrInlineChatOverlay} has room to paint over. Sharing a document
+	 * line with the summary {@link LineMining}, multiple single-line minings on
+	 * the same line would normally be concatenated onto one visual row by the
+	 * code-mining framework — the only way to actually stack extra blank rows
+	 * is a single mining whose own label contains embedded newlines, which is
+	 * what this does.
+	 */
+	private final class SpacerMining extends LineHeaderCodeMining {
+		SpacerMining(int line, IDocument document, IcrCodeMiningProvider provider, int rows)
+				throws BadLocationException {
+			super(line, document, provider, null);
+			// String#split() drops trailing empty strings, so an all-blank label would
+			// collapse to a zero-length array and reserve no height at all; a
+			// non-empty last line keeps all `rows` blank lines in the split result.
+			setLabel("\n".repeat(rows) + " ");
+		}
+	}
+
+	private static Consumer<MouseEvent> openAction(ITextViewer viewer, String threadId) {
 		return e -> {
-			// Toggle: a click while this thread's box is open just closes it; and
-			// don't reopen if an outside-click dismiss for this thread just fired.
+			boolean inline = Activator.getDefault().getPreferenceStore().getBoolean(Activator.PREF_ICR_INLINE);
+			if (inline) {
+				IcrInlineChatManager.instance().toggle(viewer, threadId);
+				return;
+			}
+			// Legacy popup: toggle — a click while this thread's box is open just
+			// closes it; and don't reopen if an outside-click dismiss for this
+			// thread just fired.
 			if (IcrThreadBox.closeIfOpenFor(threadId) || IcrThreadBox.consumeSuppressedReopen(threadId)) {
 				return;
 			}

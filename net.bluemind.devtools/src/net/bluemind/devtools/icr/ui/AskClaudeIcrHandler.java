@@ -7,6 +7,7 @@ import org.eclipse.core.resources.IFile;
 import org.eclipse.jface.text.BadLocationException;
 import org.eclipse.jface.text.IDocument;
 import org.eclipse.jface.text.ITextSelection;
+import org.eclipse.jface.text.ITextViewer;
 import org.eclipse.jface.text.Position;
 import org.eclipse.jface.viewers.ISelection;
 import org.eclipse.jface.window.Window;
@@ -91,6 +92,13 @@ public class AskClaudeIcrHandler extends AbstractHandler {
 			}
 		} catch (BadLocationException e) {
 			Activator.getDefault().getLog().warn("ICR: could not anchor thread position: " + e.getMessage());
+		}
+
+		if (Activator.getDefault().getPreferenceStore().getBoolean(Activator.PREF_ICR_INLINE)) {
+			ITextViewer viewer = IcrEditors.findViewer(workspacePath);
+			if (viewer != null) {
+				IcrInlineChatManager.instance().toggle(viewer, thread.id());
+			}
 		}
 
 		return null;
