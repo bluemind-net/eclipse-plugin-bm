@@ -209,18 +209,22 @@ public final class BmMcpServer {
 		result.put("protocolVersion", PROTOCOL_VERSION);
 		result.put("capabilities", caps);
 		result.put("serverInfo", serverInfo);
-		result.put("instructions", "Controls the running Eclipse instance for BlueMind development. Tools: "
-				+ String.join(", ", List.of(BmMcpTools.TOOL_RUN_BUNDLE, BmMcpTools.TOOL_RUN_CLASS,
-						BmMcpTools.TOOL_RUN_METHOD, BmMcpTools.TOOL_REFRESH, BmMcpTools.TOOL_GET_PROBLEMS,
-						BmMcpTools.TOOL_CLEAN, BmMcpTools.TOOL_RELOAD_TARGET, BmMcpTools.TOOL_IMPORT_PROJECTS,
-						BmMcpTools.TOOL_OPEN_PROJECTS))
-				+ ".");
+		List<String> names = new java.util.ArrayList<>(List.of(BmMcpTools.TOOL_RUN_BUNDLE, BmMcpTools.TOOL_RUN_CLASS,
+				BmMcpTools.TOOL_RUN_METHOD, BmMcpTools.TOOL_REFRESH, BmMcpTools.TOOL_GET_PROBLEMS,
+				BmMcpTools.TOOL_CLEAN, BmMcpTools.TOOL_RELOAD_TARGET, BmMcpTools.TOOL_IMPORT_PROJECTS,
+				BmMcpTools.TOOL_OPEN_PROJECTS));
+		names.addAll(net.bluemind.devtools.icr.IcrMcpTools.toolNames());
+		result.put("instructions",
+				"Controls the running Eclipse instance for BlueMind development. Tools: "
+						+ String.join(", ", names) + ".");
 		return result;
 	}
 
 	private Map<String, Object> toolsListResult() {
+		List<Map<String, Object>> tools = new java.util.ArrayList<>(BmMcpTools.descriptors());
+		tools.addAll(net.bluemind.devtools.icr.IcrMcpTools.descriptors());
 		Map<String, Object> r = new LinkedHashMap<>();
-		r.put("tools", BmMcpTools.descriptors());
+		r.put("tools", tools);
 		return r;
 	}
 
@@ -245,6 +249,18 @@ public final class BmMcpServer {
 			} catch (Exception e) {
 				LOG.error("refresh_projects error: " + e.getMessage(), e);
 				return success(id, toolTextResult("Refresh failed: " + e.getMessage(), true));
+			}
+		}
+
+		if (net.bluemind.devtools.icr.IcrMcpTools.isIcrTool(name)) {
+			try {
+				BmMcpTools.ToolResult tr = net.bluemind.devtools.icr.IcrMcpTools.invoke(name, args);
+				return success(id, toolTextResult(tr.markdown(), !tr.ok()));
+			} catch (IllegalArgumentException e) {
+				return success(id, toolTextResult(e.getMessage(), true));
+			} catch (Exception e) {
+				LOG.error(name + " error: " + e.getMessage(), e);
+				return success(id, toolTextResult(name + " failed: " + e.getMessage(), true));
 			}
 		}
 

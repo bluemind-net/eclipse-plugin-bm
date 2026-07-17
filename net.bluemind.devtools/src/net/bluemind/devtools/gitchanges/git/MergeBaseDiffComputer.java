@@ -103,6 +103,21 @@ public class MergeBaseDiffComputer {
         }
     }
 
+    /**
+     * Resolves the commit that the QuickDiff baseline / diff should be taken against:
+     * the merge-base of HEAD and the given branch (auto-detected upstream when
+     * {@code overrideBranch} is null/blank). Returns null when it cannot be determined.
+     */
+    public ObjectId resolveMergeBase(Repository repo, String overrideBranch) throws IOException {
+        ObjectId headId = repo.resolve("HEAD");
+        if (headId == null) return null;
+        ObjectId upstreamId = (overrideBranch != null && !overrideBranch.isBlank())
+            ? resolveRef(repo, overrideBranch)
+            : resolveUpstream(repo);
+        if (upstreamId == null) return null;
+        return findMergeBase(repo, headId, upstreamId);
+    }
+
     /** Resolves a user-supplied branch name to an ObjectId, trying common ref prefixes. */
     private ObjectId resolveRef(Repository repo, String branch) throws IOException {
         // Try as-is first, then with common prefixes

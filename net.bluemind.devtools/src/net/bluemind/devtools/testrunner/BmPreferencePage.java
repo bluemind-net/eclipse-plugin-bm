@@ -30,5 +30,8 @@ public class BmPreferencePage extends FieldEditorPreferencePage implements IWork
 		addField(new BooleanFieldEditor(Activator.PREF_MCP_ENABLED,
 				"Enable MCP server for Claude Code (writes ~/.config/bluemind/mcp.json)",
 				getFieldEditorParent()));
+		addField(new BooleanFieldEditor(Activator.PREF_ICR_INLINE,
+				"Show Interactive Code Review chat inline in the editor (uncheck for the popup dialog)",
+				getFieldEditorParent()));
 	}
 }
