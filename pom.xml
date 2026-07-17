@@ -6,7 +6,7 @@
 
     <groupId>net.bluemind.devtools</groupId>
     <artifactId>net.bluemind.devtools.parent</artifactId>
-    <version>1.5.0-SNAPSHOT</version>
+    <version>1.6.0-SNAPSHOT</version>
     <packaging>pom</packaging>
     <name>BlueMind Developer Tools :: Parent</name>
 
