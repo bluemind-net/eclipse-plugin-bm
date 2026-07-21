@@ -67,13 +67,17 @@ est fournie dans ce dépôt : [`.claude/commands/icr.md`](.claude/commands/icr.m
 1. **Activer le serveur MCP** : dans Eclipse, **Window → Preferences → BlueMind** → cocher
    *« Enable MCP server for Claude Code »*. Le plugin écrit alors `~/.config/bluemind/mcp/eclipse-*.json`
    (url + token loopback). `jq` doit être installé.
-2. **Installer la commande `/icr`** — copier le fichier à l'un de ces emplacements :
-   - **Globale** (toutes vos sessions Claude Code) : `~/.claude/commands/icr.md`
-     ```bash
-     mkdir -p ~/.claude/commands && cp .claude/commands/icr.md ~/.claude/commands/
-     ```
-   - **Par projet** : `<dépôt>/.claude/commands/icr.md` (p. ex. dans votre checkout
-     `bluemind-all`), pour la partager avec l'équipe via git.
+2. **Installer la commande `/icr` et ses scripts** — `/icr` appelle des scripts fixes attendus dans
+   `~/.claude/scripts/icr/` (ça évite le curl/jq inline, bloqué par l'heuristique d'obfuscation de
+   Claude Code). Copier — ou lier, pour suivre les mises à jour du dépôt — la commande et les scripts :
+   ```bash
+   mkdir -p ~/.claude/commands ~/.claude/scripts/icr
+   cp .claude/commands/icr.md  ~/.claude/commands/       # ou: ln -sf "$PWD/.claude/commands/icr.md" ~/.claude/commands/
+   cp .claude/scripts/icr/*.sh ~/.claude/scripts/icr/    # ou: ln -sf "$PWD"/.claude/scripts/icr/*.sh ~/.claude/scripts/icr/
+   chmod +x ~/.claude/scripts/icr/*.sh
+   ```
+   Puis autoriser ces scripts dans `~/.claude/settings.json`, formes tilde **et** absolue :
+   `Bash(~/.claude/scripts/icr/*)` et `Bash(/home/<vous>/.claude/scripts/icr/*)`.
 
 ### Utilisation
 
@@ -88,7 +92,7 @@ est fournie dans ce dépôt : [`.claude/commands/icr.md`](.claude/commands/icr.m
 
 ## Build local
 
-Prérequis : Java 21+, Maven 3.9+
+Prérequis : Java 21+, Maven 3.9.9+
 
 ```bash
 mvn clean verify

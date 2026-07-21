@@ -209,3 +209,10 @@ Le champ `thread` contient : `id`, `filePath` (relatif au workspace), `absoluteP
 `endLine`, `selectedText`, `body`, `status`, `replies[]` (conversation complète). Le skill `/icr`
 orchestre la boucle ; après une édition il appelle `refresh_projects` pour recompiler avant de
 répondre.
+
+**N'appelle pas ces outils ICR directement en curl.** Passe par les scripts fixes fournis dans
+`.claude/scripts/icr/` (installés en `~/.claude/scripts/icr/`, cf. README) : `icr_init.sh` (résout
+url+token), `icr_call.sh <tool> [json]` (appel générique : `icr_start`, `icr_next`, `icr_stop`…),
+`icr_poll.sh` (long-poll en tâche de fond) et `icr_reply.sh <threadId> <fichier>` (réponse lue depuis
+un fichier). Le curl/jq inline ou une fonction shell autour de curl se font bloquer par l'heuristique
+d'obfuscation de Claude Code et coûtent beaucoup plus de tokens.

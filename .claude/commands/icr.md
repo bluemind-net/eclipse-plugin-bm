@@ -37,44 +37,39 @@ same file from colliding. Threads posted while a subagent is working are queued 
 lost) and delivered on the next poll. Each subagent gets a clean, focused context (just its thread),
 so long review sessions never accumulate context or hit turn/token limits.
 
-## What to do
+## Calling the MCP endpoint
+
+All calls go through fixed scripts in `~/.claude/scripts/icr/` — never write raw curl/jq inline, and
+never define a shell function around curl. Both of those patterns (a brace-delimited function body,
+backslash-escaped `\"..\"` JSON) trip Claude Code's bash obfuscation heuristic and get blocked, and
+they also cost far more tokens than a one-line script call. The scripts:
+
+- **`icr_init.sh [workspace-filter]`** — resolves the Eclipse MCP config and writes
+  `~/.claude/tmp/icr_env.sh`. Prints the resolved config path, or `NO_CONFIG` (exit 1) if none exists.
+- **`icr_call.sh <tool_name> [json_arguments]`** — generic MCP tool call (`json_arguments` defaults to
+  `{}`). Prints the tool's result text.
+- **`icr_poll.sh`** — the background poll loop; run as-is with `run_in_background: true`.
+- **`icr_reply.sh <threadId> <bodyFile>`** — posts an `icr_reply`, reading the markdown body from a
+  file (write it with the Write tool first) so arbitrary quotes/backslashes/newlines in a reply never
+  touch shell quoting.
 
 ### Step 1 — Locate the Eclipse MCP endpoint
 
 Parse `$ARGUMENTS` for `--source` and `--repo` (default `--repo` to the current working directory).
 
-Find the config of the Eclipse open on this workspace and extract `url` + `token`:
-
 ```bash
-# There may be several if multiple Eclipse instances run (one per branch). Prefer the one whose
-# "workspace"/"projects" match the repo under review; otherwise take the first.
-ls ~/.config/bluemind/mcp/eclipse-*.json
-CFG=$(ls ~/.config/bluemind/mcp/eclipse-*.json | head -1)
-URL=$(jq -r .url "$CFG")
-TOKEN=$(jq -r .token "$CFG")
+~/.claude/scripts/icr/icr_init.sh
 ```
 
-If no config exists, tell the user to enable **Window → Preferences → BlueMind → "Enable MCP server
-for Claude Code"** and that the plugin must be installed/running, then stop.
-
-Note the resolved `URL` and `TOKEN` — you'll pass them to each per-thread subagent (Step 4). Define a
-helper for the calls you make directly from the main session (`icr_start`, `icr_stop`):
-
-```bash
-icr() { # $1=tool name, $2=arguments JSON object
-  curl -s -X POST "$URL" \
-    -H "Authorization: Bearer $TOKEN" \
-    -H "Content-Type: application/json" \
-    --max-time 60 \
-    -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"$1\",\"arguments\":$2}}" \
-    | jq -r '.result.content[0].text'
-}
-```
+If it prints `NO_CONFIG`, tell the user to enable **Window → Preferences → BlueMind → "Enable MCP
+server for Claude Code"** and that the plugin must be installed/running, then stop. There may be
+several configs if multiple Eclipse instances run (one per branch); pass a substring of the repo's
+workspace path as an argument to `icr_init.sh` to disambiguate, otherwise it takes the first found.
 
 ### Step 2 — Start the session
 
 ```bash
-icr icr_start '{"source":"<source-or-empty>","repo":"<repo>"}'
+~/.claude/scripts/icr/icr_call.sh icr_start '{"source":"<source-or-empty>","repo":"<repo>"}'
 ```
 
 This enables the **Ask Claude (ICR)…** context menu in Eclipse and re-queues any thread still
@@ -85,22 +80,14 @@ awaiting an answer. Tell the user:
 
 ### Step 3 — Listen with a background poller
 
-Run the poll loop **in the background** so the main session isn't blocked. The poller long-polls
-`icr_next`, keeps looping while the status is `idle`, and prints the payload + exits as soon as the
-status is anything else (`thread` or `inactive`). Its exit re-invokes the main session to dispatch.
+Run the poll loop **in the background** so the main session isn't blocked. It long-polls `icr_next`,
+keeps looping while the status is `idle`, and prints the payload + exits as soon as the status is
+anything else (`thread` or `inactive`). Its exit re-invokes the main session to dispatch.
 
 Launch this with `run_in_background: true`:
 
 ```bash
-CFG=$(ls ~/.config/bluemind/mcp/eclipse-*.json | head -1)
-URL=$(jq -r .url "$CFG"); TOKEN=$(jq -r .token "$CFG")
-while :; do
-  RESP=$(curl -s -X POST "$URL" \
-    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" --max-time 60 \
-    -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"icr_next","arguments":{}}}' \
-    | jq -c '.result.content[0].text | fromjson')
-  [ "$(echo "$RESP" | jq -r '.status // "idle"')" != "idle" ] && { echo "$RESP"; break; }
-done
+~/.claude/scripts/icr/icr_poll.sh
 ```
 
 When it exits:
@@ -112,10 +99,9 @@ When it exits:
 
 Do **not** handle the thread in the main session. Spawn a subagent (Agent tool) whose entire job is
 that one thread, and wait for it. Then relaunch the poller (Step 3). Give the subagent this brief,
-with `URL`, `TOKEN`, `<repo>`, and the verbatim `thread` JSON substituted in:
+with `<repo>` and the verbatim `thread` JSON substituted in:
 
-> You are handling one Interactive Code Review thread inside a running Eclipse. Endpoint: `URL` /
-> bearer token `TOKEN`. Repo: `<repo>`.
+> You are handling one Interactive Code Review thread inside a running Eclipse. Repo: `<repo>`.
 >
 > Thread JSON: `<thread>`
 >
@@ -135,17 +121,17 @@ with `URL`, `TOKEN`, `<repo>`, and the verbatim `thread` JSON substituted in:
 > 3. Post your reply (markdown, rendered in the Eclipse popup). Reference the earlier exchange; if you
 >    changed code, summarize what you did.
 >
-> Call MCP tools with curl, e.g.:
+> Call MCP tools with the fixed scripts in `~/.claude/scripts/icr/` — never write raw curl/jq inline,
+> never define a shell function around curl (both get blocked as obfuscation):
 > ```bash
-> icr() { curl -s -X POST "$URL" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
->   --max-time 60 \
->   -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"$1\",\"arguments\":$2}}" \
->   | jq -r '.result.content[0].text'; }
-> icr refresh_projects '{"projects":["net.bluemind.foo"]}'
-> icr icr_reply '{"threadId":"<id>","body":"<your markdown reply>"}'
+> ~/.claude/scripts/icr/icr_call.sh refresh_projects '{"projects":["net.bluemind.foo"]}'
+> ```
+> To reply, write your markdown to a file first (Write tool), then:
+> ```bash
+> ~/.claude/scripts/icr/icr_reply.sh "<threadId>" /path/to/reply.md
 > ```
 > Follow the **Keeping replies fast** rules below. Your final message is not shown to the user — the
-> reply the user sees is the one you post with `icr_reply`.
+> reply the user sees is the one you post with `icr_reply.sh`.
 
 When the subagent returns, relaunch the poller (Step 3).
 
@@ -154,7 +140,7 @@ When the subagent returns, relaunch the poller (Step 3).
 When the user says they are done, or the poller returned `{"status":"inactive"}`:
 
 ```bash
-icr icr_stop '{}'
+~/.claude/scripts/icr/icr_call.sh icr_stop
 ```
 
 This ends the session and disables the menu. Existing `💬` threads stay visible in open editors.
