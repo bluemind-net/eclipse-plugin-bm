@@ -22,20 +22,20 @@ This reuses the always-on Eclipse MCP server (the same one documented in
 `net.bluemind.devtools/docs/CLAUDE_CODE_MCP.md`). There is no separate server to start — `icr_start`
 simply opens a review session and enables the editor menu.
 
-## Architecture — a thin dispatcher, one agent per thread
+## Architecture — handle threads directly, reply before recompiling
 
-The main Claude session must stay free. It does **not** run the poll loop and it does **not** handle
-threads itself. Instead:
+Handle threads **directly in the main session** — do not spawn a subagent per thread. Subagent
+spawn plus serial dispatch adds latency that isn't worth it; the main session has plenty of room
+for lightweight edit-and-reply work.
 
-1. It launches a **background poller** that long-polls `icr_next` until a thread arrives, prints it,
-   and exits (Step 3). While it polls, your main session is idle and usable.
-2. When a thread arrives, the main session **spawns a fresh subagent to handle just that one thread**
-   (Step 4), waits for it, then **re-arms the poller** and goes back to idle.
-
-Threads are dispatched **serially** — one subagent at a time — which keeps concurrent edits to the
-same file from colliding. Threads posted while a subagent is working are queued server-side (not
-lost) and delivered on the next poll. Each subagent gets a clean, focused context (just its thread),
-so long review sessions never accumulate context or hit turn/token limits.
+1. Launch a **background poller** that long-polls `icr_next` until a thread arrives, prints it, and
+   exits (Step 3). While it polls, your main session is idle and usable.
+2. When a thread arrives, handle it **yourself** (Step 4): read the file, make the edit and/or
+   compose the answer, and **post the reply immediately** — before running any Eclipse recompile
+   check. Only after the reply is posted do you run `refresh_projects`/`get_problems` (in the
+   background is fine), and only when the edit plausibly warrants it (see "Keeping replies fast").
+3. Re-arm the poller right after posting the reply. If several threads land close together, don't
+   let a recompile on thread N block picking up thread N+1 — kick the recompile off and move on.
 
 ## Calling the MCP endpoint
 
@@ -76,7 +76,7 @@ This enables the **Ask Claude (ICR)…** context menu in Eclipse and re-queues a
 awaiting an answer. Tell the user:
 
 > ICR session active. In Eclipse, select code → right-click **Ask Claude (ICR)…** (or `Ctrl+Alt+C`)
-> to leave a question or change request. I'll handle each one in a dedicated agent and reply inline.
+> to leave a question or change request. I'll handle each one and reply inline.
 
 ### Step 3 — Listen with a background poller
 
@@ -95,45 +95,34 @@ When it exits:
 - Payload `{"status":"inactive"}` → the session was stopped in Eclipse. Go to Step 5.
 - Payload `{"status":"thread","thread":{…}}` → dispatch it (Step 4), then **relaunch this poller**.
 
-### Step 4 — Dispatch one subagent per thread
+### Step 4 — Handle the thread yourself, reply first
 
-Do **not** handle the thread in the main session. Spawn a subagent (Agent tool) whose entire job is
-that one thread, and wait for it. Then relaunch the poller (Step 3). Give the subagent this brief,
-with `<repo>` and the verbatim `thread` JSON substituted in:
+The thread payload has: `id`, `filePath` (workspace-relative, e.g. `/net.bluemind.foo/src/Foo.java`),
+`absolutePath`, `startLine`, `endLine`, `selectedText`, `body` (the user's request), `status`, and
+`replies` (the full conversation on this thread; the last entry is the user's latest message).
 
-> You are handling one Interactive Code Review thread inside a running Eclipse. Repo: `<repo>`.
->
-> Thread JSON: `<thread>`
->
-> The thread has: `id`, `filePath` (workspace-relative, e.g. `/net.bluemind.foo/src/Foo.java`),
-> `absolutePath`, `startLine`, `endLine`, `selectedText`, `body` (the user's request), `status`, and
-> `replies` (the full conversation on this thread; the last entry is the user's latest message).
->
-> 1. Read the file (use `absolutePath`) around `startLine`–`endLine`, using `selectedText` as the
->    precise anchor.
-> 2. Decide from `body` and `replies`:
->    - **A question / clarification** → answer it.
->    - **A change request** → edit the file, then recompile in Eclipse when warranted (see fast-mode
->      rules below). Derive the Eclipse project from the first segment of `filePath` (e.g.
->      `net.bluemind.foo`) and call `refresh_projects`; inspect `get_problems` and fix compile errors
->      before replying.
->    - **Both** → make the edit first, then answer.
-> 3. Post your reply (markdown, rendered in the Eclipse popup). Reference the earlier exchange; if you
->    changed code, summarize what you did.
->
-> Call MCP tools with the fixed scripts in `~/.claude/scripts/icr/` — never write raw curl/jq inline,
-> never define a shell function around curl (both get blocked as obfuscation):
-> ```bash
-> ~/.claude/scripts/icr/icr_call.sh refresh_projects '{"projects":["net.bluemind.foo"]}'
-> ```
-> To reply, write your markdown to a file first (Write tool), then:
-> ```bash
-> ~/.claude/scripts/icr/icr_reply.sh "<threadId>" /path/to/reply.md
-> ```
-> Follow the **Keeping replies fast** rules below. Your final message is not shown to the user — the
-> reply the user sees is the one you post with `icr_reply.sh`.
-
-When the subagent returns, relaunch the poller (Step 3).
+1. Read the file (use `absolutePath`) around `startLine`–`endLine`, using `selectedText` as the
+   precise anchor.
+2. Decide from `body` and `replies`:
+   - **A question / clarification** → answer it.
+   - **A change request** → edit the file directly.
+   - **Both** → make the edit first, then answer.
+3. Write your reply (markdown, rendered in the Eclipse popup) to a file (Write tool), then post it
+   immediately:
+   ```bash
+   ~/.claude/scripts/icr/icr_reply.sh "<threadId>" /path/to/reply.md
+   ```
+   Reference the earlier exchange; if you changed code, summarize what you did. Do this **before**
+   any recompile check — don't let Eclipse verification gate the reply.
+4. Only after the reply is posted, if the edit was non-trivial or could plausibly break compilation
+   (see "Keeping replies fast"), run the recompile check — fine to do this in the background so it
+   doesn't block re-arming the poller:
+   ```bash
+   ~/.claude/scripts/icr/icr_call.sh refresh_projects '{"projects":["net.bluemind.foo"]}'
+   ```
+   derived from the first segment of `filePath`, then inspect `get_problems`. If it surfaces a
+   compile error, fix it and post a short follow-up reply on the same thread.
+5. Relaunch the poller (Step 3) right after posting the reply — don't wait on the recompile.
 
 ### Step 5 — Stop
 
@@ -147,11 +136,11 @@ This ends the session and disables the menu. Existing `💬` threads stay visibl
 
 ## Keeping replies fast (default: fast mode)
 
-These rules are part of the brief handed to each per-thread subagent (Step 4). Replies feel slow in
-Eclipse not because of long polling (that delivers a thread the instant it's posted) but because of
-the work done *after* the thread arrives: source verification, Eclipse recompiles, and
-multi-paragraph reply generation. Threads are also handled **serially** — the next poll only resumes
-after the current reply is posted — so long turnarounds compound.
+Replies feel slow in Eclipse not because of long polling (that delivers a thread the instant it's
+posted) but because of the work done *after* the thread arrives: subagent spawn, source
+verification, Eclipse recompiles, and multi-paragraph reply generation. Handling threads directly
+(Step 4) removes the subagent-spawn cost; posting the reply before recompiling removes the
+recompile from the critical path.
 
 Default to a lean loop optimized for responsiveness:
 
@@ -159,9 +148,10 @@ Default to a lean loop optimized for responsiveness:
   Expand only when the user asks for detail.
 - **For questions, answer directly** from the code you can already see. Skip `ack`/cross-file
   verification unless the answer is non-obvious or you'd otherwise be guessing.
-- **For change requests, still edit correctly**, but only recompile (`refresh_projects` +
-  `get_problems`) when the edit is non-trivial or could plausibly break compilation. Skip the
-  recompile for trivial edits (comments, renames within a scope, string/message tweaks) and say so.
+- **For change requests, edit then reply immediately.** Only recompile (`refresh_projects` +
+  `get_problems`) afterward, and only when the edit is non-trivial or could plausibly break
+  compilation. Skip the recompile entirely for trivial edits (comments, renames within a scope,
+  string/message tweaks) and say so.
 - Don't over-explain the tooling or narrate steps — just do the work and reply.
 
 If the user asks for thoroughness (verify before answering, always recompile, detailed rationale),
