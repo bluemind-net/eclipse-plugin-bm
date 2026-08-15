@@ -1,0 +1,47 @@
+#!/usr/bin/env python3
+"""bm-eclipse-call — generic invoker for any BlueMind Eclipse MCP tool.
+
+Usage:
+  bm-eclipse-call <tool-name> [arguments-json] [bundle-hint] [--config PATH]
+
+Prints the raw markdown report. Covers every tool the plugin exposes, present
+and future — this is the fallback when no dedicated wrapper fits.
+
+Examples:
+  bm-eclipse-call list_projects
+  bm-eclipse-call sync_projects '{"apply": false}'
+  bm-eclipse-call get_problems '{"severity": "warning"}'
+"""
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _eclipse_mcp as mcp
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("tool", help="MCP tool name, e.g. list_projects, sync_projects, get_problems")
+    ap.add_argument("args_json", nargs="?", default="{}", help="JSON object of arguments (default: {})")
+    ap.add_argument("bundle_hint", nargs="?", default=None,
+                     help="Pick the Eclipse instance whose projects[] contains this bundle")
+    ap.add_argument("--config", help="MCP config file path (overrides discovery)")
+    args = ap.parse_args()
+
+    try:
+        arguments = json.loads(args.args_json)
+    except json.JSONDecodeError as e:
+        mcp.die(f"invalid arguments JSON: {e}")
+    if not isinstance(arguments, dict):
+        mcp.die("arguments must be a JSON object")
+
+    config_path = mcp.pick_config(args.config, args.bundle_hint)
+    text, is_error = mcp.call(config_path, args.tool, arguments)
+    print(text)
+    return 1 if is_error else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+"""bm-eclipse-sync — sync_projects, optional sync_working_sets, and open/close management.
+
+Usage:
+  bm-eclipse-sync [--path PATH] [--apply] [--no-remove-obsolete]
+                  [--working-sets] [--working-sets-only] [--reset-working-sets]
+                  [--working-sets-layout flat2|flat3|hybrid]
+                  [bundle-hint] [--config PATH]
+
+  bm-eclipse-sync --close NAME[,NAME...] [--apply]
+  bm-eclipse-sync --open NAME[,NAME...] [--apply]
+  bm-eclipse-sync --close-group {gwt,closure} [--apply]
+  bm-eclipse-sync --open-group {gwt,closure} [--apply]
+  bm-eclipse-sync --focus NAME[,NAME...] [--apply]
+
+Dry-run by default. --apply is required to actually touch the workspace (the
+plugin still asks for consent unless the user set the preference to
+always/never). --working-sets is opt-in — never run implicitly.
+--working-sets-only skips sync_projects entirely and implies --working-sets
+(the "orga" trigger — working sets alone, no project sync).
+--reset-working-sets implies --working-sets and wipes every existing working
+set, hand-made included, before recreating the repo layout.
+
+Working-set layouts (--working-sets-layout, default hybrid):
+  flat2  — 2 path levels (few sets, but open/parent ends up huge).
+  flat3  — 3 path levels.
+  hybrid — 2 levels, except open/parent split to 3; its sub-groups under 5
+           projects folded into open/parent/~misc.
+
+Open/close management (mutually exclusive with the default project sync —
+giving any of --close/--open/--close-group/--open-group/--focus skips
+sync_projects, this becomes a single-purpose call):
+
+  --close NAME[,NAME...]       Close these exact project names.
+  --open NAME[,NAME...]        Open these exact project names.
+  --close-group {gwt,closure}  Close every currently open project in a named
+                                group (see GROUPS below).
+  --open-group {gwt,closure}   Open every currently closed project in a
+                                named group.
+  --focus NAME[,NAME...]       Open these and everything they transitively
+                                require (Require-Bundle, read from disk so a
+                                closed provider counts too), and close every
+                                OTHER currently open project. Identifying
+                                which projects are "necessary" for a
+                                class/ticket/topic beyond that dependency
+                                closure is NOT done here — that reasoning
+                                (locate_type, get_bundle_state, a broader
+                                dependency walk) happens one level up, in the
+                                skill/caller.
+
+GROUPS are name-pattern sets for projects rarely worked on directly,
+identified by directory layout (mechanical, not name-substring guessing):
+  gwt      open/ui/gwt-libs/*, open/ui/gwt-ui-libs/* — generated GWT API/UI
+           binding mirrors, one per bundle. Deliberately excludes
+           net.bluemind.gwtconsoleapp.base (the GWT app entry point) and
+           net.bluemind.webmodule.gwtserver (the server-side RPC servlet) —
+           those aren't "rarely touched" mirrors, they're infrastructure.
+  closure  open/ui/closures/* — the closure-compiler UI bundles.
+
+Whether a group is closed BY DEFAULT (without the user asking every time) is
+a personal preference, not something this script decides — see the
+eclipse-sync skill's "Défauts personnels" section.
+"""
+import argparse
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _eclipse_mcp as mcp
+import _eclipse_workspace as ws
+
+GROUPS = ws.GROUPS
+
+
+def do_close(config_path, names, apply):
+    projects = ws.fetch_projects(config_path)
+    unknown, already, to_close = ws.plan_close(names, projects)
+
+    if unknown:
+        ws.print_capped("Not in workspace", unknown)
+    if already:
+        ws.print_capped("Already closed", already)
+    if not to_close:
+        print("Nothing to close.")
+        return 0
+    ws.print_capped("Would close" if not apply else "Closing", to_close)
+    if not apply:
+        print("\nDry-run — pass --apply to close these.")
+        return 0
+    text, is_error = mcp.call(config_path, "close_projects", {"projects": to_close})
+    print(text)
+    return 1 if is_error else 0
+
+
+def do_open(config_path, names, apply):
+    projects = ws.fetch_projects(config_path)
+    unknown, already, to_open = ws.plan_open(names, projects)
+
+    if unknown:
+        ws.print_capped("Not in workspace", unknown)
+    if already:
+        ws.print_capped("Already open", already)
+    if not to_open:
+        print("Nothing to open.")
+        return 0
+    ws.print_capped("Would open" if not apply else "Opening", to_open)
+    if not apply:
+        print("\nDry-run — pass --apply to open these.")
+        return 0
+    text, is_error = mcp.call(config_path, "open_projects", {"projects": to_open})
+    print(text)
+    return 1 if is_error else 0
+
+
+def do_close_group(config_path, group, apply):
+    projects = ws.fetch_projects(config_path)
+    matched, to_close = ws.plan_close_group(group, projects)
+    print(f"Group {group!r}: {len(matched)} project(s), {len(to_close)} currently open.")
+    if not to_close:
+        print("Nothing to close.")
+        return 0
+    ws.print_capped("Would close" if not apply else "Closing", to_close)
+    if not apply:
+        print("\nDry-run — pass --apply to close these.")
+        return 0
+    text, is_error = mcp.call(config_path, "close_projects", {"projects": to_close})
+    print(text)
+    return 1 if is_error else 0
+
+
+def do_open_group(config_path, group, apply):
+    projects = ws.fetch_projects(config_path)
+    matched, to_open = ws.plan_open_group(group, projects)
+    print(f"Group {group!r}: {len(matched)} project(s), {len(to_open)} currently closed.")
+    if not to_open:
+        print("Nothing to open.")
+        return 0
+    ws.print_capped("Would open" if not apply else "Opening", to_open)
+    if not apply:
+        print("\nDry-run — pass --apply to open these.")
+        return 0
+    text, is_error = mcp.call(config_path, "open_projects", {"projects": to_open})
+    print(text)
+    return 1 if is_error else 0
+
+
+def do_focus(config_path, names, apply):
+    projects = ws.fetch_projects(config_path)
+    root = ws.fetch_repo_root(config_path)
+    unknown, to_open, to_close = ws.plan_focus(names, projects, root)
+    focus_set = set(names)
+
+    if unknown:
+        ws.print_capped("Not in workspace (left out of focus)", unknown)
+    if root is None:
+        print("Could not read the repo root — closing down to exactly the named set,"
+              " with no dependency closure (a provider the focus set needs may end up"
+              " closed too).")
+    print(f"Focus set: {len(focus_set) - len(unknown)} project(s) kept open"
+          f" ({len(to_open)} need opening — includes what they transitively require),"
+          f" {len(to_close)} other open project(s) to close.")
+    ws.print_capped("Would open" if not apply else "Opening", to_open)
+    ws.print_capped("Would close" if not apply else "Closing", to_close)
+    if not to_open and not to_close:
+        print("Nothing to do.")
+        return 0
+    if not apply:
+        print("\nDry-run — pass --apply to switch to this focus set.")
+        return 0
+    text, is_error = mcp.call(config_path, "apply_workspace_batch", {"open": to_open, "close": to_close})
+    print(text)
+    return 1 if is_error else 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--path", help="Root directory to scan (default: BlueMind repo root)")
+    ap.add_argument("--apply", action="store_true", help="Perform the changes (default: dry-run)")
+    ap.add_argument("--no-remove-obsolete", action="store_true",
+                     help="Keep obsolete projects in the workspace instead of removing them")
+    ap.add_argument("--working-sets", action="store_true", help="Also sync working sets (opt-in)")
+    ap.add_argument("--working-sets-only", action="store_true",
+                     help="Sync working sets only, skip sync_projects (implies --working-sets)")
+    ap.add_argument("--reset-working-sets", action="store_true",
+                     help="Wipe ALL working sets and recreate them (implies --working-sets)")
+    ap.add_argument("--working-sets-layout", choices=["flat2", "flat3", "hybrid"], default="hybrid",
+                     help="Grouping layout for working sets (default: hybrid)")
+    ap.add_argument("--close", help="Comma-separated exact project names to close")
+    ap.add_argument("--open", help="Comma-separated exact project names to open")
+    ap.add_argument("--close-group", choices=sorted(GROUPS), help="Close every open project in a named group")
+    ap.add_argument("--open-group", choices=sorted(GROUPS), help="Open every closed project in a named group")
+    ap.add_argument("--focus", help="Comma-separated project names to keep open; every other open project is closed")
+    ap.add_argument("bundle_hint", nargs="?", default=None)
+    ap.add_argument("--config", help="MCP config file path (overrides discovery)")
+    args = ap.parse_args()
+
+    config_path = mcp.pick_config(args.config, args.bundle_hint)
+
+    actions = [
+        ("close", args.close), ("open", args.open),
+        ("close_group", args.close_group), ("open_group", args.open_group),
+        ("focus", args.focus),
+    ]
+    active = [(k, v) for k, v in actions if v]
+    if len(active) > 1:
+        mcp.die("only one of --close/--open/--close-group/--open-group/--focus at a time")
+
+    if active:
+        kind, value = active[0]
+        if kind == "close":
+            return do_close(config_path, ws.split_names(value), args.apply)
+        if kind == "open":
+            return do_open(config_path, ws.split_names(value), args.apply)
+        if kind == "close_group":
+            return do_close_group(config_path, value, args.apply)
+        if kind == "open_group":
+            return do_open_group(config_path, value, args.apply)
+        if kind == "focus":
+            return do_focus(config_path, ws.split_names(value), args.apply)
+
+    if args.reset_working_sets or args.working_sets_only:
+        args.working_sets = True
+
+    is_error = False
+    if not args.working_sets_only:
+        project_args = {"apply": args.apply, "removeObsolete": not args.no_remove_obsolete}
+        if args.path:
+            project_args["path"] = args.path
+        text, is_error = mcp.call(config_path, "sync_projects", project_args)
+        print(text)
+
+    if args.working_sets:
+        ws_args = {"apply": args.apply, "reset": args.reset_working_sets,
+                   "layout": args.working_sets_layout}
+        if args.path:
+            ws_args["path"] = args.path
+        if not args.working_sets_only:
+            print()
+        ws_text, ws_error = mcp.call(config_path, "sync_working_sets", ws_args)
+        print(ws_text)
+        is_error = is_error or ws_error
+
+    return 1 if is_error else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

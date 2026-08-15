@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+"""bm-eclipse-projects — wrapper around list_projects.
+
+Without a filter the full listing is several megabytes (the working-set column is
+enormous), which is unusable as a tool result — pass --name to keep only what you
+asked about. The filtering happens here, so the size never reaches the caller, and
+--name drops the working-set column unless --sets asks for it.
+
+Usage:
+  bm-eclipse-projects [--name SUBSTRING] [--sets] [--errors-only] [--closed] [--json]
+                      [bundle-hint] [--config PATH]
+"""
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _eclipse_mcp as mcp
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--name", help="Keep only projects whose name contains this (case-insensitive)")
+    ap.add_argument("--sets", action="store_true",
+                    help="With --name: also print working-set membership (dropped by default —"
+                         " it is what makes the listing unreadable)")
+    ap.add_argument("--errors-only", action="store_true", help="Only projects with compile errors")
+    ap.add_argument("--closed", action="store_true", help="Only closed projects")
+    ap.add_argument("--json", action="store_true", help="Print the structured json block instead of the markdown")
+    ap.add_argument("bundle_hint", nargs="?", default=None)
+    ap.add_argument("--config", help="MCP config file path (overrides discovery)")
+    args = ap.parse_args()
+
+    scope = "errors" if args.errors_only else "closed" if args.closed else "all"
+    config_path = mcp.pick_config(args.config, args.bundle_hint)
+    text, is_error = mcp.call(config_path, "list_projects", {"scope": scope})
+
+    if args.name:
+        data = mcp.extract_json_block(text)
+        if data is None:
+            mcp.die("no json block found in list_projects report")
+        needle = args.name.lower()
+        matches = [p for p in data.get("projects", []) if needle in p["name"].lower()]
+        if args.json:
+            if not args.sets:
+                matches = [{k: v for k, v in p.items() if k != "workingSets"} for p in matches]
+            print(json.dumps({"projects": matches}, indent=2))
+            return 1 if is_error else 0
+        print(f"# Projects ({scope}) matching {args.name!r} — {len(matches)}\n")
+        for p in matches:
+            line = f"[{'open' if p['open'] else 'closed'}] {p['name']} — {p['path']}"
+            if p["open"]:
+                line += f" — errors: {p['errors']}, warnings: {p['warnings']}"
+            if args.sets and p.get("workingSets"):
+                line += f" — sets: {', '.join(p['workingSets'])}"
+            if p.get("missingLocation"):
+                line += " — MISSING LOCATION"
+            print(f" - {line}")
+        return 1 if is_error else 0
+
+    if args.json:
+        data = mcp.extract_json_block(text)
+        if data is None:
+            mcp.die("no json block found in list_projects report")
+        print(json.dumps(data, indent=2))
+    else:
+        print(text)
+    return 1 if is_error else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

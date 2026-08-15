@@ -2,7 +2,7 @@ Manifest-Version: 1.0
 Bundle-ManifestVersion: 2
 Bundle-Name: BlueMind Developer Tools
 Bundle-SymbolicName: net.bluemind.devtools;singleton:=true
-Bundle-Version: 1.6.0.qualifier
+Bundle-Version: 1.7.0.qualifier
 Bundle-Activator: net.bluemind.devtools.Activator
 Bundle-Vendor: BlueMind
 Require-Bundle: org.eclipse.core.runtime,
@@ -34,6 +34,7 @@ Require-Bundle: org.eclipse.core.runtime,
  org.eclipse.egit.core;bundle-version="[6.0.0,8.0.0)",
  org.eclipse.egit.ui;bundle-version="[6.0.0,8.0.0)"
 Import-Package: com.sun.net.httpserver,
+ org.eclipse.osgi.service.resolver,
  org.eclipse.egit.core.internal.indexdiff;x-internal:=true,
  org.eclipse.egit.core.internal.storage;x-internal:=true,
  org.eclipse.egit.core.project;x-internal:=true,

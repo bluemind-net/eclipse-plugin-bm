@@ -12,6 +12,7 @@ import net.bluemind.devtools.testrunner.BmContext;
 import net.bluemind.devtools.testrunner.PomFileWatcher;
 import net.bluemind.devtools.testrunner.mcp.BmMcpConfigFile;
 import net.bluemind.devtools.testrunner.mcp.BmMcpServer;
+import net.bluemind.devtools.testrunner.mcp.BmMcpTools;
 
 public class Activator extends AbstractUIPlugin {
 
@@ -20,6 +21,19 @@ public class Activator extends AbstractUIPlugin {
 	public static final String PREF_ICR_INLINE = "icr.inlinePresentation";
 	public static final String PREF_POM_WATCH_JRE = "pomWatcher.jre.enabled";
 	public static final String PREF_POM_WATCH_TARGET = "pomWatcher.target.enabled";
+	/** "ask" (default) / "always" / "never" — guards import/removal of workspace projects. */
+	public static final String PREF_CONSENT_PROJECTS = "workspace.consent.projects";
+	/** "ask" (default) / "always" / "never" — guards creation/update/removal of working sets. */
+	public static final String PREF_CONSENT_WORKINGSETS = "workspace.consent.workingsets";
+	/** Newline-separated names of working sets created and managed by sync_working_sets. */
+	public static final String PREF_WORKINGSETS_MANAGED = "workspace.workingsets.managed";
+	/**
+	 * Auto-build state saved by apply_workspace_batch while auto-build is suspended
+	 * ("" = nothing suspended, "true"/"false" = value to restore). Persisted so a
+	 * crash mid-batch can be recovered at the next start(), never leaving the
+	 * workspace with auto-build silently off.
+	 */
+	public static final String PREF_AUTOBUILD_SAVED = "workspace.autobuild.saved";
 
 	/** Status icons used by the Branch Changed Files view, preloaded into the image registry. */
 	private static final String[] STATUS_ICONS = { "modified", "added", "deleted", "renamed", "copied" };
@@ -49,6 +63,14 @@ public class Activator extends AbstractUIPlugin {
 		getPreferenceStore().setDefault(PREF_POM_WATCH_TARGET, true);
 		getPreferenceStore().setDefault(PREF_MCP_ENABLED, true);
 		getPreferenceStore().setDefault(PREF_ICR_INLINE, true);
+		getPreferenceStore().setDefault(PREF_CONSENT_PROJECTS, "ask");
+		getPreferenceStore().setDefault(PREF_CONSENT_WORKINGSETS, "ask");
+		getPreferenceStore().setDefault(PREF_WORKINGSETS_MANAGED, "");
+		getPreferenceStore().setDefault(PREF_AUTOBUILD_SAVED, "");
+
+		// Recover from a batch that suspended auto-build and never restored it
+		// (e.g. a hard crash between suspend and the finally block last session).
+		BmMcpTools.restoreSuspendedAutoBuild();
 
 		if (isPomWatchEnabled() && BmContext.instance().hasGlobalPom()) {
 			PomFileWatcher.instance().start();
@@ -84,6 +106,10 @@ public class Activator extends AbstractUIPlugin {
 			getPreferenceStore().removePropertyChangeListener(prefListener);
 			prefListener = null;
 		}
+		// Last-resort net: if a batch is still holding auto-build suspended, restore it.
+		BmMcpTools.restoreSuspendedAutoBuild();
+		// Same idea for the doctor's informative job: never leave one behind.
+		BmMcpTools.stopDoctorStatus();
 		PomFileWatcher.instance().stop();
 		stopMcpServer();
 		IcrSessionStore.instance().removeListener(icrListener);
