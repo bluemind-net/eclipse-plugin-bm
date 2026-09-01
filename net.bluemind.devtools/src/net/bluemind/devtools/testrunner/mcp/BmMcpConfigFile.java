@@ -20,6 +20,8 @@ import org.eclipse.core.runtime.ILog;
 import org.eclipse.core.runtime.IPath;
 import org.eclipse.core.runtime.Platform;
 
+import net.bluemind.devtools.testrunner.PomPropertyReader;
+
 public final class BmMcpConfigFile {
 
 	private static final ILog LOG = Platform.getLog(BmMcpConfigFile.class);
@@ -49,6 +51,9 @@ public final class BmMcpConfigFile {
 		payload.put("authHeader", "Authorization");
 		payload.put("authScheme", "Bearer");
 		payload.put("workspace", workspacePath());
+		java.nio.file.Path repoRoot = PomPropertyReader.findRepoRoot().orElse(null);
+		payload.put("repoRoot", repoRoot == null ? null : repoRoot.toString());
+		payload.put("branch", GitBranchReader.currentBranch(repoRoot).orElse(null));
 		payload.put("projects", openProjectNames());
 		payload.put("pid", ProcessHandle.current().pid());
 		payload.put("writtenAt", System.currentTimeMillis());

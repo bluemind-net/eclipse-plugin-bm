@@ -1,7 +1,9 @@
 target/
 bin/
+__pycache__/
 .settings/
 .project
 .classpath
 *.class
 PLAN-ECLIPSE-PLUGIN.md
+tmp/

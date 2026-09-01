@@ -1,0 +1,2299 @@
+#!/usr/bin/env python3
+"""bm-eclipse-doctor — Eclipse compile-error triage and repair, driven by PDE facts.
+
+One call, no conversational round-trip: --apply repairs everything mechanically
+repairable and only hands back real code errors.
+
+Every diagnostic pass is ONE read (`doctor_snapshot`: workspace_info + get_problems +
+list_projects + get_bundle_state + unresolvedTypes) and every workspace remedy of that
+pass goes through ONE `apply_workspace_batch` (delete + open + import + refresh + clean,
+auto-build suspended, a single build). Maven rebuilds go through ONE reactor.
+
+Classification is by FACT, not by symptom or by message shape:
+
+  metadataInvisible non-empty (PDE metadata on disk, invisible to Eclipse) -> refresh
+  not in the workspace, .project on disk                                   -> import
+  closed                                                                   -> open (transitive)
+  declared source folder missing/empty                                     -> maven rebuild
+  resolved, yet the dependent still has markers                            -> clean the dependent
+  neither in the workspace nor on disk                                     -> reload_target_platform
+  unresolved type JDT knows about (jdt-visible)                            -> clean the dependent
+  unresolved type only on disk (disk-only)                                 -> refresh+clean supplier
+  unresolved type nowhere, in generated sources, untracked                 -> delete + clean
+  none of the above                                                        -> real code error, hand off
+
+The three type-level facts come from the plugin (`unresolvedTypes`), which asks the JDT
+model and the disk; the script never parses a message to get a missing name — markers
+carry `problemKind` and `unresolvedName` as structured attributes.
+
+Stale GWT codegen is invisible to PDE (both bundles stay resolved; the error is a JDT
+error inside generated sources). Pairing has three states: `paired` with the freshness
+signal (rebuild), `paired` without it (real doubt -> report), and `no-counterpart` (the
+question does not apply -> never report-only, either an orphan codegen output or a
+hand-off).
+
+Traceability: [doctor:decision] / [doctor:outcome] / [doctor:pass] / [doctor:handoff]
+lines on stdout tie each remedy to its effect, and the arithmetic is verifiable: each
+project's delta is attributed to exactly one remedy. Nothing is ever written to disk
+unless asked (--report-out).
+
+Usage:
+  bm-eclipse-doctor [--apply] [--sync] [--fix-gwt] [--report] [--report-all-facts]
+                    [--report-out PATH] [--severity error|warning|all] [--json]
+                    [--summary] [bundle-hint] [--config PATH]
+                    [--open NAME[,NAME...]] [--close NAME[,NAME...]]
+                    [--open-group {gwt,closure}] [--close-group {gwt,closure}]
+                    [--focus NAME[,NAME...]]
+
+--open/--close/--open-group/--close-group compose freely into one workspace-shape
+change (--focus is exclusive with all four: it already says "this set open,
+everything else closed" in one call). Whichever combination is given runs AFTER
+--sync (so a name can target a project --sync just imported) and BEFORE the
+diagnostic snapshot that feeds --apply's repair loop — never after: repairing
+against a shape about to change wastes decisions on projects headed for closure,
+and stays blind to whatever the projects being opened are about to reveal (a
+55-project open cascaded into 5291 errors on release/FEATBL-3713 that a separate,
+later `--apply` had to pick up — one call instead of two closes that gap).
+
+A project named in --close/--close-group/--focus's close set is PROTECTED for
+the rest of the run: if the repair loop's ordinary `closed`/`closed-provider`
+fact would reopen it to satisfy some other project, it closes that OTHER
+project instead (fact `protected-closed`) rather than silently undoing the
+close just asked for — and propagates the same protection to whatever it just
+closed, so a whole orphaned chain converges instead of reopening the first link.
+If the project that would need closing was ITSELF asked open this same run
+(--open/--focus's open set), that is a genuine conflict between two explicit
+asks — neither side is silently overridden; it comes back as a guarded hand-off
+naming both projects instead.
+
+--focus's close set is NOT "everything not named": it excludes the focus
+target's own transitive Require-Bundle closure (see _eclipse_workspace.py's
+plan_focus/bundle_closure), read from disk so a closed provider still counts.
+Without this, --focus's mechanical "close every other open project" — with no
+notion of what the target actually needs — could close providers the target
+required and then PROTECT them from reopening, which is exactly what happened
+on FEATBL-3661 (14/08): 2 projects focused, 362 closed, 30292 errors came back
+as protected-conflict instead of the one-call fix --focus+--apply is meant to
+be. `--focus` now opens the target's dependencies right alongside it, so the
+set it protects closed is only ever what the target genuinely does not need.
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+import xml.etree.ElementTree as ET
+from collections import defaultdict, deque
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _eclipse_mcp as mcp
+import _eclipse_workspace as ws
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+SCRIPT_VERSION = "2.0"
+
+# Tools this script cannot work without: their absence means the running Eclipse has an
+# older plugin, which is worth saying plainly instead of failing on a JSON-RPC error.
+# This IS the script/plugin contract — there is no version number to compare.
+REQUIRED_TOOLS = ("doctor_snapshot", "get_bundle_state", "apply_workspace_batch", "doctor_status",
+                  "locate_type", "remove_projects")
+
+SKIP_DIRS = {".git", "node_modules", "target", "bin", ".metadata"}
+MAX_PASSES = 4
+
+# A source folder nobody writes by hand. Every generated kind="src" entry in the repo is
+# named this way (generated, generated/, wsdl.generated, hollow-generated), and the rule
+# is independent of the IDE language — unlike a message pattern.
+GENERATED_HINT = "generated"
+
+# Structured marker attributes whose `unresolvedName` names a type the compiler could not
+# find. Language-independent: they are IProblem ids, decoded by the plugin.
+# missing-type-in-signature is the MissingTypeIn{Method,Constructor,Lambda} family: the
+# reference is in a member's signature, not in the source being compiled, so it used to
+# come out as problemKind=other with no name at all — release/5.6 handed back 4 errors on
+# 3 projects for `refers to the missing type SecurityContext` and a plain clean fixed
+# them, which is the remedy this very table prescribes for jdt-visible.
+UNRESOLVED_KINDS = ("undefined-type", "import-not-found", "classpath-incorrect",
+                    "missing-type-in-signature")
+
+# Past this many projects in one batch, say so before acting. A batch of 32 is measured
+# and harmless; nothing says what several hundred cleans cost, and a full-workspace
+# refresh as a universal net would mean a complete rebuild of 1300 projects.
+BATCH_VOLUME_ANNOUNCE = 150
+
+# Shape normalisation for hand-off lines: two runs are only comparable if the variable
+# parts of a message are replaced by placeholders.
+SHAPE_QUOTED_RES = (
+    re.compile(r"'[^']{1,80}'"),
+    re.compile(r'"[^"]{1,80}"'),
+    re.compile(r"`[^`]{1,80}`"),
+    re.compile(r"[‘“][^’”]{1,80}[’”]"),
+)
+SHAPE_DOTTED_RE = re.compile(r"\b[A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*){2,}\b")
+SHAPE_NUMBER_RE = re.compile(r"\b\d+\b")
+
+REMEDY_REFRESH = "refresh"
+REMEDY_OPEN = "open"
+REMEDY_IMPORT = "import"
+REMEDY_CLEAN = "clean"
+REMEDY_REBUILD = "rebuild-maven"
+REMEDY_RELOAD = "reload-target-platform"
+REMEDY_DELETE = "delete-generated"
+REMEDY_REMOVE = "remove-project"
+REMEDY_CLOSE = "close"
+
+# Facts checked in order for an unresolved dependency; also the list of candidates a
+# --report run prints as "rejected" alongside the fact that won.
+FACT_ORDER = ("closed", "metadata-invisible", "not-imported", "missing-source-folders",
+              "dependency-resolved", "target-platform-missing")
+
+
+class Heartbeat:
+    """Print elapsed time to stderr every ~interval seconds while a long MCP call
+    blocks. A backgrounded run buffers stdout until the call returns, so without
+    this the terminal looks hung. Elapsed only — it never calls MCP (that would
+    serialise behind the in-flight call on the single-instance server)."""
+
+    def __init__(self, phase, interval=5.0):
+        self.phase = phase
+        self.interval = interval
+        self._stop = threading.Event()
+        self._thread = None
+        self._start = 0.0
+
+    def __enter__(self):
+        self._start = time.monotonic()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def _run(self):
+        while not self._stop.wait(self.interval):
+            print(f"[doctor] {self.phase} … {time.monotonic() - self._start:.0f}s",
+                  file=sys.stderr, flush=True)
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=1)
+        return False
+
+
+class Report:
+    """The only thing this script ever writes, and only when given a path. Two files:
+    a .jsonl of every [doctor:*] record (structured, replayable, one object per line)
+    and a markdown summary laid out like the skill's "what to report back" section.
+
+    It also absorbs the bulk output — the relayed Maven log and the batch reports — so
+    the terminal keeps the summary and the status instead of 758 Kb of scrollback."""
+
+    def __init__(self, path):
+        base, ext = os.path.splitext(path)
+        self.md_path = path if ext else path + ".md"
+        self.jsonl_path = base + ".jsonl"
+        self.records = []
+        self.bulk = []          # (title, text)
+
+    def record(self, entry):
+        self.records.append(entry)
+
+    def section(self, title, text):
+        self.bulk.append((title, text))
+
+    def write(self, snap, args):
+        with open(self.jsonl_path, "w", encoding="utf-8") as f:
+            for entry in self.records:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        with open(self.md_path, "w", encoding="utf-8") as f:
+            f.write(self._markdown(snap, args))
+
+    def _markdown(self, snap, args):
+        run = self._first("run") or {}
+        end = self._first("end") or {}
+        out = []
+        out.append(f"# Doctor — {run.get('branch', '(branche inconnue)')}\n")
+        out.append("## Chiffres\n")
+        before = end.get("errors_before", run.get("errors", 0))
+        after = end.get("errors_after", snap.error_count)
+        out.append(f"- erreurs : **{before} → {after}**")
+        out.append(f"- réparées mécaniquement : **{end.get('decided_errors', 0)}**")
+        out.append(f"- rendues : **{end.get('handoff_errors', 0)}** sur"
+                   f" **{end.get('handoff_projects', 0)}** projet(s)")
+        if end.get("guarded_errors"):
+            out.append(f"- rendues mais expliquées : **{end.get('guarded_errors')}**")
+        out.append(f"- passes : {end.get('passes', 1)} | mode :"
+                   f" {'apply' if args.apply else 'diagnostic'} | script {SCRIPT_VERSION}"
+                   f" | plugin {run.get('plugin', '?')}")
+        out.append(f"- workspace au repos à la lecture : {snap.settled} ({snap.settle_rounds} tour(s))\n")
+
+        out.append("## Comptabilité par passe\n")
+        passes = self._all("pass")
+        if not passes:
+            out.append("_Aucune passe (0 erreur)._\n")
+        else:
+            out.append("| passe | avant | après | attribué | non attribué | révélé | induit |"
+                       " aveugle | verdict |")
+            out.append("|---|---|---|---|---|---|---|---|---|")
+            for entry in passes:
+                out.append(f"| {entry.get('pass')} | {entry.get('errors_before')} |"
+                           f" {entry.get('errors_after')} | {entry.get('attributed')} |"
+                           f" {entry.get('unattributed')} | {entry.get('revealed', '')} |"
+                           f" {entry.get('induced', '')} | {entry.get('blind', '')} |"
+                           f" {entry.get('verdict', '')} |")
+            out.append("\nUn `attribué` différent du delta signifie que la comptabilité est fausse :"
+                       " le dire, pas recopier les chiffres. `induit` = erreurs apparues sur des"
+                       " projets en aval de ce que la passe a touché : le prix du remède, pas une"
+                       " régression.\n")
+
+        out.append("## Décisions et verdicts\n")
+        outcomes = self._all("outcome")
+        if not outcomes:
+            out.append("_Aucune décision._\n")
+        else:
+            out.append("| passe | remède | cible | fait | avant | après | verdict |")
+            out.append("|---|---|---|---|---|---|---|")
+            for entry in outcomes:
+                out.append(f"| {entry.get('pass')} | {entry.get('remedy')} | {entry.get('target')} |"
+                           f" {entry.get('facts', '')} | {entry.get('errors_before')} |"
+                           f" {entry.get('errors_after')} | {entry.get('verdict')} |")
+            out.append("")
+
+        out.append("## Cas non classés — intégralité\n")
+        total = self._first("handoff-total") or {}
+        out.append(f"{total.get('errors', 0)} erreur(s) sur {total.get('projects', 0)} projet(s)"
+                   f" — familles : {total.get('kinds', '(aucune)')}\n")
+        out.append("| projet | erreurs | problem_kind | forme du message |")
+        out.append("|---|---|---|---|")
+        for entry in self._all("handoff"):
+            shape = str(entry.get("shape", "")).replace("|", "\\|")
+            out.append(f"| {entry.get('project')} | {entry.get('errors')} |"
+                       f" {entry.get('problem_kind', '')} | {shape} |")
+        out.append("")
+
+        unresolved = self._all("unresolved")
+        if unresolved:
+            # The same name is emitted every pass it is still unresolved in — one row
+            # per pass duplicated the whole table instead of showing what changed. Only
+            # the latest pass's row is kept; "passe" says which one.
+            latest = {}
+            for entry in unresolved:
+                name = entry.get("name")
+                if name not in latest or (entry.get("pass") or 0) >= (latest[name].get("pass") or 0):
+                    latest[name] = entry
+            out.append("## Types non résolus\n")
+            out.append("| nom | passe | fait | fournisseur | suivi git | demandé par |")
+            out.append("|---|---|---|---|---|---|")
+            for name in sorted(latest):
+                entry = latest[name]
+                out.append(f"| {name} | {entry.get('pass', '')} | {entry.get('kind')} |"
+                           f" {entry.get('provider', '')} | {entry.get('tracked', '')} |"
+                           f" {entry.get('requested_by', '')} |")
+            out.append("")
+
+        out.append("## Vérifications faites en dehors du doctor\n")
+        out.append("_À compléter par qui restitue le run : toute commande lancée à côté de l'outil"
+                   " (`find`, `git`, second diagnostic) avec son résultat. Chacune désigne un fait"
+                   " que le snapshot devrait porter._\n")
+
+        if self.bulk:
+            out.append("## Sorties brutes\n")
+            for title, text in self.bulk:
+                out.append(f"### {title}\n")
+                out.append("```")
+                out.append(text.rstrip())
+                out.append("```\n")
+
+        out.append("---\n")
+        out.append(f"Enregistrements structurés : `{os.path.basename(self.jsonl_path)}`"
+                   f" ({len(self.records)} ligne(s)).")
+        return "\n".join(out) + "\n"
+
+    def _all(self, record):
+        return [r for r in self.records if r.get("record") == record]
+
+    def _first(self, record):
+        found = self._all(record)
+        return found[-1] if found else None
+
+
+class Ctx:
+    """Everything a pass needs: where to call, how loudly to report, which pass."""
+
+    def __init__(self, config_path, severity, report, out=None, all_facts=False):
+        self.config_path = config_path
+        self.severity = severity
+        self.report = report
+        self.out = out                  # a Report, or None — the ONLY way a file is written
+        self.all_facts = all_facts
+        self.pass_no = 0
+        self.repo_root = None
+        self.disk = {}
+        # (fact, remedy, target) triples proven no-effect THIS run. Memory across passes
+        # of one repair_loop only — a run is never replayed to compare against another.
+        self.no_effect_memory = set()
+        # Projects remove_projects refused, and projects it actually removed. Same
+        # per-run memory: a guard fires on disk content, which no pass of this run
+        # changes, so re-asking is re-asking for the same no. Without this, release/5.6
+        # replayed the same 10 refusals at all 3 passes — and since the tool is
+        # all-or-nothing, those 10 also blocked the 20 removals that were fine.
+        self.remove_refused = set()
+        self.removed = set()
+        # package -> provider project names, from Export-Package on disk manifests.
+        # Built once, lazily, the first pass that actually needs it (lot E4).
+        self.export_index = None
+        # Projects explicitly asked open/closed THIS run (--open/--close/--open-group/
+        # --close-group/--focus, applied before the first snapshot — see
+        # run_workspace_shape). protected_closed grows across passes: whatever gets
+        # closed to keep one of these projects closed is protected in turn, so an
+        # orphaned chain converges instead of bouncing between closing and reopening.
+        self.protected_open = set()
+        self.protected_closed = set()
+
+    def call(self, tool, args, phase=None):
+        with Heartbeat(phase or tool):
+            start = time.monotonic()
+            text, is_error = mcp.call(self.config_path, tool, args)
+        if self.report:
+            emit("timing", pass_no=self.pass_no, tool=tool,
+                 ms=f"{(time.monotonic() - start) * 1000:.0f}")
+        return text, is_error
+
+
+_QUIET = False
+_RECORDER = None
+
+
+class quiet:
+    """Suppress traceability lines. Used when a plan is computed only to compare it
+    with the previous one — the real pass prints its own decisions."""
+
+    def __enter__(self):
+        global _QUIET
+        _QUIET = True
+
+    def __exit__(self, *exc):
+        global _QUIET
+        _QUIET = False
+        return False
+
+
+def emit(record, /, **fields):
+    """One traceability line: [doctor:<record>] key=value … — human-readable in the
+    terminal, trivially greppable, and re-parsable by whoever reads the run later.
+    When a report file is asked for, the same record goes to the .jsonl untouched.
+
+    The record name is positional-only, and the .jsonl calls it `record` rather than
+    `kind`: a field named `kind` is exactly what [doctor:unresolved] carries."""
+    if _QUIET:
+        return
+    clean = {}
+    for key, value in fields.items():
+        if value is None or value == "":
+            continue
+        clean["pass" if key == "pass_no" else key] = value
+    if _RECORDER is not None:
+        _RECORDER.record({"record": record, **clean})
+    parts = []
+    for key, value in clean.items():
+        text = "true" if value is True else "false" if value is False else str(value)
+        parts.append(f'{key}="{text}"' if " " in text else f"{key}={text}")
+    print(f"[doctor:{record}] " + " ".join(parts), flush=True)
+
+
+def show(ctx, title, text, head=12):
+    """Bulk output: everything to the report file if there is one, a head to the
+    terminal. Without --report-out the behaviour is unchanged — full text on stdout."""
+    if ctx.out is None:
+        print(text)
+        return
+    ctx.out.section(title, text)
+    lines = text.splitlines()
+    for line in lines[:head]:
+        print(line)
+    if len(lines) > head:
+        print(f"… {len(lines) - head} more line(s) → {ctx.out.md_path}")
+
+
+def message_shape(message):
+    """The shape of a message, not its content: quoted identifiers, dotted names and
+    numbers replaced. This is what makes two runs comparable and what reveals a
+    missing classifier."""
+    shape = message or ""
+    for pattern in SHAPE_QUOTED_RES:
+        shape = pattern.sub("<X>", shape)
+    shape = SHAPE_DOTTED_RE.sub("<X>", shape)
+    shape = SHAPE_NUMBER_RE.sub("N", shape)
+    return " ".join(shape.split())[:120]
+
+
+# --- disk facts PDE cannot supply -----------------------------------------
+
+
+def project_name_on_disk(dot_project):
+    try:
+        root = ET.parse(dot_project).getroot()
+    except (ET.ParseError, OSError):
+        return None
+    name = root.find("name")
+    return name.text.strip() if name is not None and name.text else None
+
+
+def scan_disk_projects(repo_root):
+    """project name -> directory, for every .project on disk. Answers the two
+    questions PDE cannot: is an unknown bundle on disk at all (import) or nowhere
+    (target platform), and where are its declared source folders."""
+    out = {}
+    if not repo_root or not os.path.isdir(repo_root):
+        return out
+    for dirpath, dirnames, filenames in os.walk(repo_root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        if ".project" not in filenames:
+            continue
+        # One .project per Eclipse project: do not descend further.
+        dirnames[:] = []
+        name = project_name_on_disk(os.path.join(dirpath, ".project"))
+        if name:
+            out[name] = dirpath
+    return out
+
+
+def source_folders(project_dir):
+    """(declared, generated, missing) kind="src" entries of a .classpath, relative
+    paths. 'generated' is name-based on purpose: it is the only IDE-language-free
+    way to say "nobody writes here by hand"."""
+    classpath = os.path.join(project_dir, ".classpath") if project_dir else None
+    if not classpath or not os.path.isfile(classpath):
+        return [], [], []
+    try:
+        tree = ET.parse(classpath)
+    except ET.ParseError:
+        return [], [], []
+    declared, generated, missing = [], [], []
+    for entry in tree.getroot().findall("classpathentry"):
+        if entry.get("kind") != "src":
+            continue
+        path = entry.get("path")
+        if not path or path.startswith("/"):
+            continue
+        path = path.rstrip("/")
+        declared.append(path)
+        if GENERATED_HINT in os.path.basename(path).lower():
+            generated.append(path)
+        full = os.path.join(project_dir, path)
+        if not os.path.isdir(full) or not os.listdir(full):
+            missing.append(path)
+    return declared, generated, missing
+
+
+def newest_mtime(project_dir, relative_paths):
+    """Newest mtime under the given relative paths (file or directory). 0.0 when
+    nothing exists there — a missing side never claims to be the fresher one."""
+    newest = 0.0
+    for rel in relative_paths:
+        full = os.path.join(project_dir, rel)
+        if os.path.isfile(full):
+            newest = max(newest, os.path.getmtime(full))
+            continue
+        if not os.path.isdir(full):
+            continue
+        for dirpath, dirnames, filenames in os.walk(full):
+            dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+            for filename in filenames:
+                try:
+                    newest = max(newest, os.path.getmtime(os.path.join(dirpath, filename)))
+                except OSError:
+                    pass
+    return newest
+
+
+# closed_project_requires/_split_bundle_names moved to _eclipse_workspace.py
+# (bundle_requires) — plan_focus needs the same disk-manifest read for closed
+# projects, so it lives once in the shared module now.
+
+
+# --- the snapshot ---------------------------------------------------------
+
+
+class Snapshot:
+    """One pass's worth of facts, indexed. Nothing here is a verdict."""
+
+    def __init__(self, data):
+        self.raw = data
+        self.workspace = data.get("workspace") or {}
+        problems = data.get("problems") or {}
+        self.error_count = problems.get("errors", 0)
+        self.warning_count = problems.get("warnings", 0)
+        self.projects = {p["name"]: p for p in data.get("projects") or []}
+        self.bundles = {b["name"]: b for b in data.get("bundles") or [] if b.get("name")}
+        self.unknown_bundles = set(data.get("unknownBundles") or [])
+        self.bundle_by_project = {b["project"]: b for b in self.bundles.values() if b.get("project")}
+        # Whether the workspace was actually quiet when the markers were read. Used to be
+        # a manual counter-check after the fact; it is a field of the snapshot now.
+        self.settled = data.get("settled")
+        self.settle_rounds = data.get("settleRounds")
+        # name -> {kind, jdtProjects, diskProjects, diskPath, tracked, requestedBy}
+        self.unresolved_types = {t["name"]: t for t in data.get("unresolvedTypes") or []
+                                 if t.get("name")}
+        self.unresolved_truncated = bool(data.get("unresolvedTypesTruncated"))
+
+        self.markers = defaultdict(list)
+        for marker in problems.get("markers") or []:
+            project = marker.get("project") or marker.get("path", "").lstrip("/").split("/")[0]
+            self.markers[project].append(marker)
+
+    def errors_by_project(self):
+        return {name: info.get("errors", 0) for name, info in self.projects.items()}
+
+    def errored_projects(self):
+        out = {}
+        for project, markers in self.markers.items():
+            errors = [m for m in markers if str(m.get("severity")) == "error"]
+            if errors:
+                out[project] = errors
+        return out
+
+    def bundle_of(self, project):
+        return self.bundle_by_project.get(project) or self.bundles.get(project)
+
+
+def read_snapshot(ctx, extra_bundles=None):
+    args = {"severity": ctx.severity, "waitForBuild": True}
+    if extra_bundles:
+        args["bundles"] = sorted(extra_bundles)
+    text, _ = ctx.call("doctor_snapshot", args, phase="doctor_snapshot (waiting for build)")
+    data = mcp.extract_json_block(text)
+    if data is None:
+        mcp.die("no json block found in doctor_snapshot report")
+    return Snapshot(data)
+
+
+# --- classification ------------------------------------------------------
+
+
+class Decision:
+    def __init__(self, project, dep, fact, remedy, target, rejected=None, errors=0, blind=False):
+        self.project = project      # the project whose errors motivated this
+        self.dep = dep              # the dependency the fact is about, if any
+        self.fact = fact
+        self.remedy = remedy
+        self.target = target        # what the remedy is applied to
+        self.rejected = rejected or []
+        self.errors = errors        # markers this decision claims
+        # Applied without being justified by a fact (lot B4: refresh-everything-in-error
+        # is free inside a batch that builds anyway). Its delta is never credited to a
+        # classification — see report_outcomes.
+        self.blind = blind
+
+
+class Plan:
+    def __init__(self):
+        self.decisions = []
+        self.refresh = set()
+        self.open = set()
+        self.imports = set()
+        self.clean = set()
+        self.delete = set()         # workspace-relative generated files to delete
+        self.remove = set()         # untracked shell projects to remove (lot E1/C5)
+        self.close = set()         # dependents of a protected-closed project (see Ctx)
+        self.rebuild = []           # ordered: maven needs api before api.gwt
+        self.reload_target = False
+        self.gwt_reported = []      # (api, gwt, signals, abstract_hits) — one signal only
+        self.handoff = {}           # project -> list of markers handed back
+        # project -> reason a decision that would have explained it was blocked (lot B):
+        # the open-radius cap, or a no-effect/clean guard rebuild_plan applied. A hand-off
+        # with a reason here is explained-but-guarded, not an unclassified defect.
+        self.guarded = {}
+        # project -> names already covered by a root decision for it (lot D3): a later
+        # marker citing the same unresolvedName under a different problemKind is not a
+        # second, unclassified problem.
+        self.resolved_names = defaultdict(set)
+
+    def add(self, decision):
+        self.decisions.append(decision)
+        if decision.remedy == REMEDY_REFRESH:
+            self.refresh.add(decision.target)
+        elif decision.remedy == REMEDY_OPEN:
+            self.open.add(decision.target)
+        elif decision.remedy == REMEDY_IMPORT:
+            self.imports.add(decision.target)
+        elif decision.remedy == REMEDY_CLEAN:
+            self.clean.add(decision.target)
+        elif decision.remedy == REMEDY_REBUILD:
+            if decision.target not in self.rebuild:
+                self.rebuild.append(decision.target)
+        elif decision.remedy == REMEDY_RELOAD:
+            self.reload_target = True
+        elif decision.remedy == REMEDY_REMOVE:
+            self.remove.add(decision.target)
+        elif decision.remedy == REMEDY_CLOSE:
+            self.close.add(decision.target)
+
+    def has_actions(self):
+        return bool(self.refresh or self.open or self.imports or self.clean or self.rebuild
+                    or self.delete or self.reload_target or self.remove or self.close)
+
+    def touched(self):
+        """Projects one batch would act on — the volume to announce before acting."""
+        return self.refresh | self.open | self.imports | self.clean | self.remove | self.close
+
+    def signature(self):
+        """What the plan would do, order-independent — the thing to compare between
+        passes to notice we are about to replay an ineffective remedy."""
+        return (tuple(sorted(self.refresh)), tuple(sorted(self.open)), tuple(sorted(self.imports)),
+                tuple(sorted(self.clean)), tuple(sorted(self.rebuild)), tuple(sorted(self.delete)),
+                tuple(sorted(self.remove)), tuple(sorted(self.close)), self.reload_target)
+
+
+def unresolved_requires(bundle):
+    """The dependencies PDE itself reports as missing. Not the unresolved entries of
+    'requires': when a bundle fails to resolve, the resolver leaves every one of its
+    suppliers null, so that list would name all its dependencies. The resolver errors
+    name exactly the ones that are actually missing."""
+    if not bundle:
+        return []
+    out = []
+    for err in bundle.get("resolverErrors") or []:
+        if err.get("type") != "MISSING_REQUIRE_BUNDLE":
+            continue
+        name = err.get("constraint") or err.get("data")
+        if name:
+            out.append(str(name).split(";")[0].strip())
+    return sorted(set(out))
+
+
+def missing_import_packages(bundle):
+    if not bundle:
+        return []
+    return sorted({str(err.get("constraint") or err.get("data"))
+                   for err in bundle.get("resolverErrors") or []
+                   if err.get("type") == "MISSING_IMPORT_PACKAGE"})
+
+
+def build_export_index(ctx):
+    """package -> provider project names, read from Export-Package headers on
+    MANIFEST.MF on disk. Not the live PDE model: doctor_snapshot itself builds bundles
+    with includePackages=false, and the reported case's provider was CLOSED — PDE has
+    no model for a closed project at all (see ws.bundle_requires)."""
+    index = defaultdict(set)
+    for project, project_dir in ctx.disk.items():
+        manifest = os.path.join(project_dir, "META-INF", "MANIFEST.MF")
+        if not os.path.isfile(manifest):
+            continue
+        try:
+            with open(manifest, encoding="utf-8", errors="replace") as f:
+                raw = f.read()
+        except OSError:
+            continue
+        lines = []
+        for line in raw.splitlines():
+            if line.startswith(" ") and lines:
+                lines[-1] += line[1:]
+            else:
+                lines.append(line)
+        for line in lines:
+            if not line.startswith("Export-Package:"):
+                continue
+            for name in ws.split_bundle_names(line.split(":", 1)[1]):
+                index[name].add(project)
+    return index
+
+
+def export_index(ctx):
+    """Built once, lazily — only the first pass that actually has a
+    MISSING_IMPORT_PACKAGE to resolve pays for scanning every manifest on disk."""
+    if ctx.export_index is None:
+        ctx.export_index = build_export_index(ctx)
+    return ctx.export_index
+
+
+def transitive_closed(roots, snap, disk):
+    """From closed projects, follow Require-Bundle to every further CLOSED project —
+    the whole set to reopen in one batch. Read from disk manifests (ws.bundle_requires)
+    because PDE has no model for a closed project."""
+    def is_closed(name):
+        info = snap.projects.get(name)
+        return info is not None and not info.get("open")
+
+    out = {r for r in roots if is_closed(r)}
+    seen = set(roots)
+    queue = deque(roots)
+    while queue:
+        current = queue.popleft()
+        for dep in ws.bundle_requires(disk.get(current)):
+            if dep in seen:
+                continue
+            seen.add(dep)
+            queue.append(dep)
+            if is_closed(dep):
+                out.add(dep)
+    return out
+
+
+def require_closure(project, snap):
+    """Everything reachable from a project through Require-Bundle, itself included —
+    PDE's own resolved graph, not a MANIFEST re-parse.
+
+    This is the filter that keeps a `disk-only` verdict honest: a simple type name can
+    exist in several projects of a monorepo, and refreshing a namesake the dependent
+    has no link to would come back as no-effect. Only a supplier inside the closure can
+    be the one the compiler was looking at."""
+    names = {project}
+    queue = deque([project])
+    while queue:
+        current = queue.popleft()
+        bundle = snap.bundle_of(current)
+        if not bundle:
+            continue
+        owner = bundle.get("project")
+        if owner:
+            names.add(owner)
+        for requirement in bundle.get("requires") or []:
+            name = requirement.get("name")
+            if not name or name in names:
+                continue
+            names.add(name)
+            queue.append(name)
+    return names
+
+
+def dependency_fact(dep, snap, disk):
+    """(fact, remedy, target, detail, rejected) for one unresolved dependency, decided
+    on facts in the plan's priority order. Returns fact=None when the dependency looks
+    healthy by every measure — that is a real code error, not a mechanical one."""
+    rejected = []
+    project_info = snap.projects.get(dep)
+    bundle = snap.bundles.get(dep) or snap.bundle_by_project.get(dep)
+    disk_dir = disk.get(dep)
+
+    if project_info is not None and not project_info.get("open"):
+        return "closed", REMEDY_OPEN, dep, None, rejected
+    rejected.append("closed")
+
+    invisible = (bundle or {}).get("metadataInvisible")
+    if invisible:
+        return "metadata-invisible", REMEDY_REFRESH, dep, ",".join(invisible), rejected
+    rejected.append("metadata-invisible")
+
+    if project_info is None and bundle is None and disk_dir:
+        return "not-imported", REMEDY_IMPORT, dep, None, rejected
+    rejected.append("not-imported")
+
+    if disk_dir:
+        _, _, missing = source_folders(disk_dir)
+        if missing:
+            return "missing-source-folders", REMEDY_REBUILD, dep, ",".join(missing), rejected
+    rejected.append("missing-source-folders")
+
+    if bundle is not None and bundle.get("resolved"):
+        # The dependency resolves fine on its side, yet the dependent still cannot see
+        # it: stale build state on the DEPENDENT, so the clean targets the dependent.
+        return "dependency-resolved", REMEDY_CLEAN, None, None, rejected
+    rejected.append("dependency-resolved")
+
+    if project_info is None and bundle is None and not disk_dir:
+        return "target-platform-missing", REMEDY_RELOAD, dep, None, rejected
+    rejected.append("target-platform-missing")
+
+    return None, None, None, None, rejected
+
+
+def gwt_signals(project, errors, snap, disk):
+    """Stale GWT codegen, from signals PDE is blind to:
+      A — an error sits in a GENERATED source folder (nobody writes there by hand);
+      B — the .api sources (or its model.json) are newer than the .gwt generated ones.
+
+    Signal B needs a counterpart to compare against. When the project in error IS the
+    .api, there is none, and 'B is absent' would be a false statement about a question
+    that does not apply — which is exactly how a guard-rail fires on a case where no
+    doubt exists. Hence three states, not two:
+
+      pairing=paired,         fresh=True  -> rebuild the pair
+      pairing=paired,         fresh=False -> real doubt, report only
+      pairing=no-counterpart, fresh=None  -> inapplicable, decide on something else
+
+    Returns None when there is no generated source folder in error to speak of."""
+    project_dir = disk.get(project)
+    if not project_dir:
+        return None
+    _, generated, _ = source_folders(project_dir)
+    if not generated:
+        return None
+
+    prefixes = tuple(f"/{project}/{folder}/" for folder in generated)
+    in_generated = [m for m in errors if str(m.get("path", "")).startswith(prefixes)]
+    if not in_generated:
+        return None
+    other = [m for m in errors if m not in in_generated]
+    abstract_hits = sum(1 for m in in_generated
+                        if m.get("problemKind") == "abstract-method-not-implemented")
+
+    signals = ["marker-in-generated"]
+    api = project[: -len(".gwt")] if project.endswith(".gwt") else None
+    api_dir = disk.get(api) if api else None
+    if api is None or api_dir is None:
+        return {"pairing": "no-counterpart", "fresh": None, "signals": signals, "api": api,
+                "generated": generated, "in_generated": in_generated, "other": other,
+                "hits": abstract_hits}
+
+    api_declared, _, _ = source_folders(api_dir)
+    api_sources = [f for f in api_declared if GENERATED_HINT not in os.path.basename(f).lower()]
+    api_sources.append(os.path.join("generated", "model.json"))
+    fresh = newest_mtime(api_dir, api_sources) > newest_mtime(project_dir, generated)
+    if fresh:
+        signals.append("api-newer-than-generated")
+    return {"pairing": "paired", "fresh": fresh, "signals": signals, "api": api,
+            "generated": generated, "in_generated": in_generated, "other": other,
+            "hits": abstract_hits}
+
+
+def orphan_candidates(project, project_dir, generated, type_name, markers):
+    """Every file of a generated source folder that belongs to the missing type: the
+    files carrying the markers, their siblings whose name starts with the type
+    (ITickConfiguration -> …Async.java, …Promise.java), AND — lot E3 — every other file
+    in the SAME package as those markers. A generated package usually hangs together
+    off one deleted root (bindings, async wrappers, promises that do not share its
+    name prefix); matching by prefix alone caught only the direct siblings, so a chain
+    took one delete-generated pass per remaining layer instead of the whole closure at
+    once. The list is submitted as a whole — the plugin deletes all of it or none of
+    it, and refuses on the first file git tracks, so widening the selection costs
+    nothing but an extra look at files that turn out to be safe."""
+    paths = {str(m.get("path")) for m in markers if m.get("path")}
+    same_package = set()
+    prefix = f"/{project}/"
+    for path in paths:
+        if path.startswith(prefix):
+            same_package.add(os.path.dirname(os.path.join(project_dir, path[len(prefix):])))
+    for folder in generated:
+        base = os.path.join(project_dir, folder)
+        if not os.path.isdir(base):
+            continue
+        for dirpath, dirnames, filenames in os.walk(base):
+            dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+            for filename in filenames:
+                if not filename.endswith(".java"):
+                    continue
+                if dirpath not in same_package and not filename.startswith(type_name):
+                    continue
+                rel = os.path.relpath(os.path.join(dirpath, filename), project_dir)
+                paths.add(f"/{project}/{rel}".replace(os.sep, "/"))
+    return sorted(paths)
+
+
+def names_label(names, cap=3):
+    """A fact has to name what it is about without becoming a paragraph."""
+    ordered = sorted(names)
+    shown = ",".join(ordered[:cap])
+    return shown + (f"(+{len(ordered) - cap})" if len(ordered) > cap else "")
+
+
+def type_facts(ctx, snap, project, errors, plan, closed_roots, dependents):
+    """The four type-level facts, for one project in error with nothing unresolved on
+    the PDE side. Returns the markers NOT explained by any of them."""
+    stale = defaultdict(list)                    # name -> markers, JDT knows the type
+    providers = defaultdict(lambda: {"names": set(), "markers": [], "ambiguous": 1})
+    closed_providers = defaultdict(lambda: {"names": set(), "markers": []})
+    nowhere = defaultdict(list)                  # name -> markers
+    out_of_closure = defaultdict(list)           # name -> markers
+    rest = []
+    closure = None
+
+    for marker in errors:
+        name = marker.get("unresolvedName")
+        if not name or marker.get("problemKind") not in UNRESOLVED_KINDS:
+            rest.append(marker)
+            continue
+        entry = snap.unresolved_types.get(name)
+        if entry is None:
+            rest.append(marker)
+            continue
+        kind = entry.get("kind")
+        if kind == "jdt-visible" and entry.get("jdtProjects"):
+            stale[name].append(marker)
+        elif kind == "jdt-visible":
+            # jdt-visible with an EMPTY jdtProjects means the JRE/a library resolved it,
+            # not a workspace project: the discriminant is who provides the type, not
+            # how it is spelled. `java.util.HashSet` unresolved is a missing import in
+            # the source, not stale build state — no owning project to clean.
+            rest.append(marker)
+        elif kind == "disk-only":
+            if closure is None:
+                closure = require_closure(project, snap)
+            candidates = [p for p in entry.get("diskProjects") or [] if p in closure]
+            if not candidates:
+                out_of_closure[name].append(marker)
+                continue
+            for candidate in candidates:
+                slot = providers[candidate]
+                slot["names"].add(name)
+                slot["markers"].append(marker)
+                slot["ambiguous"] = max(slot["ambiguous"], len(candidates))
+        elif kind == "closed-provider":
+            for provider in entry.get("diskProjects") or []:
+                slot = closed_providers[provider]
+                slot["names"].add(name)
+                slot["markers"].append(marker)
+        elif kind == "nowhere":
+            nowhere[name].append(marker)
+        else:
+            rest.append(marker)
+
+    if stale:
+        count = sum(len(v) for v in stale.values())
+        fact = f"stale-build-state:{names_label(stale)}@{project}"
+        plan.add(Decision(project, None, fact, REMEDY_CLEAN, project, errors=count))
+        plan.resolved_names[project] |= set(stale)
+        emit("decision", pass_no=ctx.pass_no, project=project, fact=fact, remedy=REMEDY_CLEAN,
+             target=project, errors=count)
+
+    for provider in sorted(providers):
+        slot = providers[provider]
+        count = len(slot["markers"])
+        fact = f"source-invisible:{names_label(slot['names'])}@{provider}"
+        ambiguous = slot["ambiguous"] if slot["ambiguous"] > 1 else None
+        # The supplier is refreshed AND cleaned; the dependent is cleaned. The run of
+        # 2026-07-27 applied both without telling them apart, so which one was needed is
+        # not established — the outcome lines are what will settle it.
+        remedies = [(REMEDY_REFRESH, provider), (REMEDY_CLEAN, provider)]
+        if project != provider:
+            remedies.append((REMEDY_CLEAN, project))
+        for remedy, target in remedies:
+            plan.add(Decision(project, provider, fact, remedy, target, errors=count))
+            emit("decision", pass_no=ctx.pass_no, project=project, dep=provider, fact=fact,
+                 remedy=remedy, target=target, errors=count, ambiguous=ambiguous)
+        plan.resolved_names[project] |= slot["names"]
+
+    for provider, slot in sorted(closed_providers.items()):
+        # No plan.add() here: the type just names a closed supplier, it does not decide
+        # how to open it. The `if closed_roots:` batch below (fed by this AND the
+        # Require-Bundle walk) computes the transitive closure once, applies the open
+        # radius cap, and attributes to the project waiting on it — same mechanism, one
+        # more kind of fact feeding it.
+        closed_roots.add(provider)
+        dependents[provider].add(project)
+        plan.resolved_names[project] |= slot["names"]
+        emit("decision", pass_no=ctx.pass_no, project=project, dep=provider,
+             fact=f"closed-provider:{names_label(slot['names'])}", remedy=REMEDY_OPEN,
+             target=provider, errors=len(slot["markers"]))
+
+    for name, markers in sorted(out_of_closure.items()):
+        # Said out loud instead of silently falling into the hand-off: the type exists on
+        # disk, but in no project this one requires.
+        emit("decision", pass_no=ctx.pass_no, project=project, dep=name,
+             fact=f"source-invisible-out-of-closure:{name}", remedy="handoff", target=project,
+             errors=len(markers))
+        rest.extend(markers)
+
+    if nowhere:
+        rest.extend(orphan_facts(ctx, snap, project, nowhere, plan))
+    return rest
+
+
+def orphan_facts(ctx, snap, project, nowhere, plan):
+    """A type that exists nowhere, referenced from a GENERATED source folder by files
+    git does not track, is codegen output whose input was deleted. Everything else goes
+    back to the user: 'I do not know' is said, not disguised as caution."""
+    project_dir = ctx.disk.get(project)
+    _, generated, _ = source_folders(project_dir)
+    prefixes = tuple(f"/{project}/{folder}/" for folder in generated)
+    rest = []
+    for name, markers in sorted(nowhere.items()):
+        in_generated = [m for m in markers if str(m.get("path", "")).startswith(prefixes)]
+        rest.extend(m for m in markers if m not in in_generated)
+        if not in_generated:
+            continue
+        files = orphan_candidates(project, project_dir, generated, name, in_generated)
+        if not files:
+            rest.extend(in_generated)
+            continue
+        fact = f"orphan-generated:{name}"
+        plan.delete |= set(files)
+        plan.add(Decision(project, None, fact, REMEDY_DELETE, project, errors=len(in_generated)))
+        plan.add(Decision(project, None, fact, REMEDY_CLEAN, project, errors=len(in_generated)))
+        plan.resolved_names[project].add(name)
+        emit("decision", pass_no=ctx.pass_no, project=project, fact=fact, remedy=REMEDY_DELETE,
+             target=project, errors=len(in_generated), files=len(files))
+    return rest
+
+
+def project_level_stale(project, errors, snap):
+    """A marker on the project resource ITSELF (not a file inside it — no
+    unresolvedName, no problemKind at all) while the project's own bundle already
+    resolves: the workspace's build-order bookkeeping is stale from a batch that just
+    closed/reopened/rebuilt something nearby, not a real code error. Eclipse's own
+    generic build-order marker ("The project cannot be built until its prerequisite
+    X is built") has no IProblem id and no PDE resolver error behind it — it carries
+    no structured argument at all, so the discriminant is where it sits (the project,
+    not a file) plus the one fact the snapshot already has (resolved), never the
+    message text. Same remedy as `dependency-resolved` (resolved bundle, dependent
+    still marked), reached from a project-level marker instead of a resolver-graph
+    walk. Returns (matched, rest)."""
+    bundle = snap.bundle_of(project)
+    if not bundle or not bundle.get("resolved"):
+        return [], errors
+    matched, rest = [], []
+    for marker in errors:
+        path = marker.get("path")
+        if (marker.get("unresolvedName") or marker.get("problemKind")
+                or path not in (project, f"/{project}")):
+            rest.append(marker)
+        else:
+            matched.append(marker)
+    return matched, rest
+
+
+def classify(ctx, snap):
+    """Facts -> plan, emitting one [doctor:decision] line per decision. The remedy
+    graph is walked from the errored projects down to the ROOT unresolved bundles, so a
+    cascade produces one decision on the root instead of one per dependent."""
+    plan = Plan()
+    errored = snap.errored_projects()
+
+    # Lot E1: a project git recognises no tracked file under, anywhere in its
+    # directory, is a shell — checked FIRST and pulled out of `errored` entirely, so
+    # it is never also run through the error-driven pipeline below (lot C5's ordering:
+    # a shell's own markers, however shaped, are not a second problem to classify).
+    already_refused = []
+    for name in sorted(n for n, info in snap.projects.items() if info.get("tracked") is False):
+        if name in ctx.remove_refused:
+            # A guard that already said no this run says no again: not a decision to
+            # retake, and keeping it in the lot would sterilise every other removal.
+            already_refused.append(name)
+            errored.pop(name, None)
+            continue
+        plan.add(Decision(name, None, "stale-project:untracked-shell", REMEDY_REMOVE, name,
+                          errors=len(errored.get(name, []))))
+        emit("decision", pass_no=ctx.pass_no, project=name, fact="stale-project:untracked-shell",
+             remedy=REMEDY_REMOVE, target=name)
+        errored.pop(name, None)
+    if already_refused:
+        emit("remove-skipped", pass_no=ctx.pass_no, projects=len(already_refused),
+             detail=names_label(already_refused))
+
+    dependents = defaultdict(set)      # root dependency -> projects waiting on it
+    roots = []
+    seen_deps = set()
+    queue = deque()
+
+    for project in sorted(errored):
+        bundle = snap.bundle_of(project)
+        missing = unresolved_requires(bundle)
+        # Lot E4: Require-Bundle was the only edge in this graph; Import-Package named
+        # a missing package, not a bundle, so it never fed the walk at all — the
+        # reported provider was CLOSED, PDE had no model for it either way. Resolved
+        # through the disk Export-Package index, a missing import package becomes an
+        # ordinary root dependency, same as a missing Require-Bundle.
+        providers = set()
+        for package in missing_import_packages(bundle):
+            providers |= export_index(ctx).get(package, set())
+        for dep in list(missing) + sorted(providers):
+            dependents[dep].add(project)
+            if dep not in seen_deps:
+                seen_deps.add(dep)
+                queue.append(dep)
+        if not missing and not providers:
+            roots.append(project)
+
+    # Walk down the unresolved graph: a dependency that is itself missing dependencies
+    # is not the root — its own missing ones are.
+    leaves = []
+    while queue:
+        dep = queue.popleft()
+        bundle = snap.bundles.get(dep) or snap.bundle_by_project.get(dep)
+        deeper = []
+        if bundle and not bundle.get("resolved"):
+            deeper = list(unresolved_requires(bundle))
+            for package in missing_import_packages(bundle):
+                deeper.extend(sorted(export_index(ctx).get(package, set())))
+        if deeper:
+            for deeper_dep in deeper:
+                dependents[deeper_dep] |= dependents[dep] or {dep}
+                if deeper_dep not in seen_deps:
+                    seen_deps.add(deeper_dep)
+                    queue.append(deeper_dep)
+            continue
+        leaves.append(dep)
+
+    closed_roots = set()
+    for dep in sorted(leaves):
+        fact, remedy, target, detail, rejected = dependency_fact(dep, snap, ctx.disk)
+        affected = sorted(dependents.get(dep) or {dep})
+        if fact is None:
+            for project in affected:
+                plan.handoff.setdefault(project, list(errored.get(project, [])))
+            continue
+        if fact == "closed":
+            closed_roots.add(dep)
+            continue
+        for project in affected:
+            count = len(errored.get(project, []))
+            decision = Decision(project, dep, fact if not detail else f"{fact}:{detail}",
+                                remedy, target if target is not None else project, rejected,
+                                errors=count)
+            plan.add(decision)
+            emit("decision", pass_no=ctx.pass_no, project=project, dep=dep,
+                 fact=decision.fact, remedy=remedy, target=decision.target, errors=count,
+                 rejected=",".join(rejected) if ctx.report else None)
+
+    # The closed_roots batch is handled once, AFTER the roots loop below: type_facts
+    # (lot A2) feeds the same closed_roots/dependents from a type-level fact
+    # (closed-provider), discovered only while classifying those projects, and both
+    # sources must be in before the transitive closure and the radius cap are computed.
+
+    # Projects in error with nothing unresolved: their own source folders, an unresolved
+    # type, stale GWT codegen, or a real code error.
+    for project in roots:
+        errors = errored[project]
+        _, _, missing = source_folders(ctx.disk.get(project))
+        if missing:
+            count = len(errors)
+            decision = Decision(project, None, f"missing-source-folders:{','.join(missing)}",
+                                REMEDY_REBUILD, project, errors=count)
+            plan.add(decision)
+            emit("decision", pass_no=ctx.pass_no, project=project, fact=decision.fact,
+                 remedy=REMEDY_REBUILD, target=project, errors=count)
+            continue
+
+        # Lot C5: JDT's own "build path is incomplete" marker, named — not auto-repaired.
+        # A reload does not rebuild a JRE container that is simply absent, and by the
+        # time we get here lot E1 has already pulled out the untracked-shell case this
+        # branch turned out to actually be on the branch that reported it.
+        broken_classpath = [m for m in errors if m.get("problemKind") == "build-path-incomplete"]
+        if broken_classpath:
+            emit("decision", pass_no=ctx.pass_no, project=project, fact="broken-classpath",
+                 remedy="handoff", target=project, errors=len(broken_classpath))
+            plan.handoff.setdefault(project, []).extend(broken_classpath)
+            errors = [m for m in errors if m not in broken_classpath]
+            if not errors:
+                continue
+
+        # The type-level facts come first: they are the ones that name a missing type,
+        # and they leave the abstract-method errors (the real GWT signal) untouched.
+        errors = type_facts(ctx, snap, project, errors, plan, closed_roots, dependents)
+        if not errors:
+            continue
+
+        stale, errors = project_level_stale(project, errors, snap)
+        if stale:
+            fact = "build-order-stale"
+            plan.add(Decision(project, None, fact, REMEDY_CLEAN, project, errors=len(stale)))
+            emit("decision", pass_no=ctx.pass_no, project=project, fact=fact,
+                 remedy=REMEDY_CLEAN, target=project, errors=len(stale))
+        if not errors:
+            continue
+
+        gwt = gwt_signals(project, errors, snap, ctx.disk)
+        if gwt:
+            if gwt["pairing"] == "paired" and gwt["fresh"]:
+                # Maven orders the reactor, so api before api.gwt.
+                count = len(gwt["in_generated"])
+                fact = "stale-gwt-codegen:" + "+".join(gwt["signals"])
+                for artifact in (gwt["api"], project):
+                    plan.add(Decision(project, gwt["api"], fact, REMEDY_REBUILD, artifact,
+                                      errors=count))
+                emit("decision", pass_no=ctx.pass_no, project=project, dep=gwt["api"], fact=fact,
+                     remedy=REMEDY_REBUILD, target=f"{gwt['api']}+{project}", errors=count)
+            elif gwt["pairing"] == "paired":
+                plan.gwt_reported.append((gwt["api"], project, gwt["signals"], gwt["hits"]))
+                emit("decision", pass_no=ctx.pass_no, project=project, dep=gwt["api"],
+                     fact="stale-gwt-codegen-partial:" + "+".join(gwt["signals"]),
+                     remedy="report-only", target=project, errors=len(gwt["in_generated"]))
+            else:
+                # No counterpart: the freshness question does not apply, so it is not a
+                # doubt and it must not come out as report-only. Nothing above explained
+                # these markers, so they go back to the user, named for what they are.
+                emit("decision", pass_no=ctx.pass_no, project=project,
+                     fact="gwt-pairing-inapplicable", remedy="handoff", target=project,
+                     errors=len(gwt["in_generated"]))
+                plan.handoff.setdefault(project, []).extend(gwt["in_generated"])
+            if gwt["other"]:
+                # Errors outside the generated folders are not codegen: back to the user.
+                plan.handoff.setdefault(project, []).extend(gwt["other"])
+            continue
+
+        plan.handoff.setdefault(project, []).extend(errors)
+
+    if closed_roots:
+        # A root closed EXPLICITLY this run (--close/--close-group/--focus, see
+        # run_workspace_shape) stays closed: the ordinary remedy for "closed" is to
+        # reopen it, which would silently undo the very thing just asked for. Split
+        # before computing the transitive reopen set — a protected root's own
+        # Require-Bundle chain is never walked at all, since it is never going to open.
+        protected_roots = {r for r in closed_roots if r in ctx.protected_closed}
+        open_roots = closed_roots - protected_roots
+
+        if protected_roots:
+            newly_protected = set()
+            for root in sorted(protected_roots):
+                for project in sorted(dependents.get(root, set())):
+                    if project in ctx.protected_closed:
+                        continue  # already closing / staying closed, nothing to add
+                    if project in ctx.protected_open:
+                        # Two explicit asks collide (one project's --open, another's
+                        # --close/--focus, and the first needs the second): neither is
+                        # silently overridden — named hand-off instead of a guess.
+                        plan.handoff.setdefault(project, list(errored.get(project, [])))
+                        plan.guarded[project] = f"protected-conflict: needs closed {root}"
+                        emit("decision", pass_no=ctx.pass_no, project=project, dep=root,
+                             fact="protected-conflict", remedy="handoff", target=project)
+                        continue
+                    plan.add(Decision(project, root, "protected-closed", REMEDY_CLOSE, project,
+                                      errors=len(errored.get(project, []))))
+                    emit("decision", pass_no=ctx.pass_no, project=project, dep=root,
+                         fact="protected-closed", remedy=REMEDY_CLOSE, target=project)
+                    newly_protected.add(project)
+            # Propagated so the NEXT pass treats this project itself as protected too:
+            # if something else depends on it, that dependent closes as well instead of
+            # this one reopening to satisfy it — an orphaned chain converges instead of
+            # bouncing between closing and reopening (release/FEATBL-3713, 14/08).
+            ctx.protected_closed |= newly_protected
+
+        if open_roots:
+            # The transitive set is computed once so the whole closed subgraph goes into
+            # a single batch. Every open decision is attributed to the projects that were
+            # WAITING on the closed roots, not to the reopened projects themselves: a
+            # project reopened transitively starts at 0 errors (closed projects report 0),
+            # so attributing to it would read any of its own errors as a regression.
+            waiting = sorted({p for root in open_roots for p in dependents.get(root, set())})
+            transitive = sorted(transitive_closed(open_roots, snap, ctx.disk))
+            # No radius cap: `open`'s WorkspaceConsent gate (apply_workspace_batch, plugin
+            # side) already announces the batch size and asks before touching the workspace
+            # when the user's preference is "ask" — a second, script-level threshold here
+            # would just duplicate that signal instead of adding a real guarantee, since the
+            # transitive closure is opened whole or not at all either way (never a partial
+            # subset: a bundle still missing one Require-Bundle stays unresolved regardless).
+            for name in transitive:
+                for project in waiting or [name]:
+                    plan.add(Decision(project, name, "closed", REMEDY_OPEN, name,
+                                      errors=len(errored.get(project, []))))
+                emit("decision", pass_no=ctx.pass_no, project=",".join(waiting[:3]) or name,
+                     dep=name, fact="closed", remedy=REMEDY_OPEN, target=name)
+
+    apply_no_effect_memory(ctx, plan, errored)
+    guard_clean_targets(ctx, plan, snap, errored)
+    reattach_by_name(ctx, plan)
+    add_blind_refresh(ctx, plan, snap)
+    report_collateral(ctx, plan)
+    return plan
+
+
+def rebuild_plan(plan, survivors, dropped, errored, ctx, reason):
+    """Common shape for the two guards below: keep the surviving decisions, route every
+    dropped one's project back to the user with a named reason instead of silently
+    letting the remedy through."""
+    fresh = Plan()
+    fresh.handoff, fresh.delete = plan.handoff, plan.delete
+    fresh.gwt_reported = plan.gwt_reported
+    fresh.guarded = dict(plan.guarded)
+    for decision in survivors:
+        fresh.add(decision)
+    for decision in dropped:
+        emit("decision-blocked", pass_no=ctx.pass_no, project=decision.project, fact=decision.fact,
+             remedy=decision.remedy, target=decision.target, reason=reason)
+        fresh.handoff.setdefault(decision.project, list(errored.get(decision.project, [])))
+        fresh.guarded[decision.project] = reason
+    plan.decisions = fresh.decisions
+    plan.refresh, plan.open, plan.imports = fresh.refresh, fresh.open, fresh.imports
+    plan.clean, plan.rebuild, plan.reload_target = fresh.clean, fresh.rebuild, fresh.reload_target
+    plan.remove, plan.close = fresh.remove, fresh.close
+    plan.guarded = fresh.guarded
+
+
+def apply_no_effect_memory(ctx, plan, errored):
+    """A (fact, remedy, target) triple already proven no-effect THIS run is never
+    redecided: on release/5.6, 4 causes were redecided identically at passes 1, 2 and
+    3 — 13 no-effect verdicts and two whole passes (two Eclipse builds) for nothing.
+    delete-generated is excluded: C2 is what makes its own no-effect trustworthy."""
+    if not ctx.no_effect_memory:
+        return
+    survivors, dropped = [], []
+    for decision in plan.decisions:
+        key = (decision.fact.split(":")[0], decision.remedy, decision.target)
+        (dropped if key in ctx.no_effect_memory else survivors).append(decision)
+    if dropped:
+        rebuild_plan(plan, survivors, dropped, errored, ctx, "known no-effect this run")
+
+
+def guard_clean_targets(ctx, plan, snap, errored):
+    """No clean on a project the PDE model does not know: `source=`/`resolved=` come
+    from the same bundle model a clean acts on, and every project release/5.6 cleaned
+    successfully had both — the four blocked ones did not. The discriminant was already
+    in the snapshot; nothing read it."""
+    survivors, dropped = [], []
+    for decision in plan.decisions:
+        if decision.remedy != REMEDY_CLEAN:
+            survivors.append(decision)
+            continue
+        bundle = snap.bundle_of(decision.target)
+        if bundle is not None and bundle.get("source") is not None and bundle.get("resolved") is not None:
+            survivors.append(decision)
+        else:
+            dropped.append(decision)
+    if dropped:
+        rebuild_plan(plan, survivors, dropped, errored, ctx, "no PDE model (source=/resolved= absent)")
+
+
+def reattach_by_name(ctx, plan):
+    """A handed-back marker whose unresolvedName is already covered by a root decision
+    on the SAME project is not a second, unclassified problem — whatever its own
+    problemKind. This is what put the same root in both `decided` and `handoff` on
+    release/5.6 (3 projects), and the 256 markers that were really just downstream of
+    a clean that succeeded: their problemKind (e.g. undefined-name) is not one
+    type_facts classifies on, but the name is the same one a decision already owns."""
+    for project in list(plan.handoff):
+        names = plan.resolved_names.get(project)
+        if not names:
+            continue
+        markers = plan.handoff[project]
+        keep = [m for m in markers if m.get("unresolvedName") not in names]
+        removed = len(markers) - len(keep)
+        if not removed:
+            continue
+        emit("handoff-reattached", pass_no=ctx.pass_no, project=project, count=removed,
+             names=names_label(names))
+        if keep:
+            plan.handoff[project] = keep
+        else:
+            del plan.handoff[project]
+
+
+def report_collateral(ctx, plan):
+    """Per pass, not a verdict: how many hand-back markers sit on a project this SAME
+    pass already targets with a remedy (presumed collateral of a build in flight) vs
+    one it does not touch at all. Useful while the run is in progress, unlike the
+    hand-off itself which only means something read on the final plan (lot D1)."""
+    targeted = plan.touched() | set(plan.rebuild)
+    collateral = sum(len(m) for p, m in plan.handoff.items() if p in targeted)
+    other = sum(len(m) for p, m in plan.handoff.items() if p not in targeted)
+    if collateral or other:
+        emit("collateral", pass_no=ctx.pass_no, collateral=collateral or None, other=other or None)
+
+
+def add_blind_refresh(ctx, plan, snap):
+    """Free remedies, applied without a fact: the batch is going to build the
+    workspace anyway once it has ANY classified remedy, so refreshing every project
+    currently in error and every supplier named by an unresolved-type fact costs
+    nothing extra and clears part of the metadata-invisible / source-invisible
+    families before classification even runs. Credited to `blind`, never to a fact
+    (see report_outcomes) — free is not the same as decided."""
+    if not plan.has_actions():
+        return  # nothing is building this pass; a blind refresh would not be free
+    targets = set(snap.errored_projects())
+    for entry in snap.unresolved_types.values():
+        targets |= set(entry.get("diskProjects") or [])
+        targets |= set(entry.get("jdtProjects") or [])
+    added = set()
+    for name in sorted(targets):
+        if (name in plan.refresh or name in plan.open or name in plan.imports
+                or name in plan.remove or name in plan.close):
+            continue
+        info = snap.projects.get(name)
+        if info is None or not info.get("open"):
+            continue  # open/import are guarded remedies, not free ones
+        plan.add(Decision(name, None, "blind:refresh", REMEDY_REFRESH, name, blind=True))
+        added.add(name)
+    if added:
+        emit("decision", pass_no=ctx.pass_no, fact="blind:refresh", remedy=REMEDY_REFRESH,
+             target=names_label(added, cap=8), errors=0)
+
+
+def report_handoff(ctx, plan):
+    """The hand-off, in full when a report is being written. The 5-shape cut exists for
+    a terminal; a report that inherits it hides the distribution, and a hand-picked
+    example instead of the distribution is what made the 2026-07-27 run unreadable."""
+    cap = None if ctx.out else 5
+    total_errors = 0
+    kinds = defaultdict(int)
+    for project, markers in sorted(plan.handoff.items()):
+        total_errors += len(markers)
+        shapes = defaultdict(int)
+        for marker in markers:
+            kind = marker.get("problemKind") or "unknown"
+            kinds[kind] += 1
+            shapes[(kind, message_shape(marker.get("message", "")))] += 1
+        ordered = sorted(shapes.items(), key=lambda kv: -kv[1])
+        for (kind, shape), count in (ordered if cap is None else ordered[:cap]):
+            emit("handoff", pass_no=ctx.pass_no, project=project, errors=count,
+                 problem_kind=kind, shape=shape)
+    if plan.handoff:
+        emit("handoff-total", pass_no=ctx.pass_no, errors=total_errors,
+             projects=len(plan.handoff),
+             kinds=",".join(f"{k}:{n}" for k, n in sorted(kinds.items(), key=lambda kv: -kv[1])))
+    if plan.guarded:
+        # Lot B: a hand-off with a reason here is explained but withheld by a guard —
+        # not a defect in classification, which is what the "attribué != delta" rule
+        # in the skill would otherwise conclude.
+        guarded_errors = sum(len(plan.handoff.get(p, [])) for p in plan.guarded)
+        emit("handoff-guarded", pass_no=ctx.pass_no, errors=guarded_errors,
+             projects=len(plan.guarded), reasons=names_label(set(plan.guarded.values())))
+
+
+# --- applying ------------------------------------------------------------
+
+
+def announce_volume(plan):
+    """A batch this size has never been measured — say so before doing it, rather than
+    after. Not a confirmation prompt: a decidable fact does not become undecidable
+    because there is a lot of it."""
+    touched = plan.touched()
+    if len(touched) < BATCH_VOLUME_ANNOUNCE:
+        return
+    names = sorted(touched)
+    print(f"\n⚠ Large batch: {len(names)} project(s) in one operation"
+          f" (refresh {len(plan.refresh)}, open {len(plan.open)}, import {len(plan.imports)},"
+          f" clean {len(plan.clean)}, close {len(plan.close)}). Runs above"
+          f" {BATCH_VOLUME_ANNOUNCE} are not measured; a clean means a full rebuild of"
+          " each project.")
+    print("  " + ", ".join(names[:20]) + (f" (+{len(names) - 20} more)" if len(names) > 20 else ""))
+
+
+def apply_plan(ctx, plan):
+    """Maven does not touch Eclipse, so it never has to wait behind a batch. Two
+    shapes, chosen by whether the reactor's targets overlap the batch's own targets:
+
+    - disjoint: nothing races (Maven writes into project directories the batch never
+      opens/refreshes/cleans), so the reactor runs in a background thread while the
+      batch runs on the main thread. bm-rebuild-module refreshes its own targets when
+      it is done — a second, small, incremental build, proportional to the rebuilt
+      set, not the whole pass;
+    - overlapping (the common case: a rebuilt api's own project is also being
+      refreshed/cleaned): the reactor runs FIRST, fully joined, then its targets are
+      folded into the SAME batch (--no-refresh) — one Eclipse build for the pass, and
+      no clean racing a `target/`/`generated/` Maven is still writing to."""
+    # Lot B5: non-Eclipse work runs ahead of phase, in parallel with everything below
+    # that blocks on Eclipse. The Export-Package index (lot E4) depends only on
+    # ctx.disk, which never changes within a run, so pre-warming it here costs nothing
+    # on every pass after the first that actually needs one — export_index() itself
+    # only ever scans the manifests once (see its own cache check).
+    export_thread = threading.Thread(target=export_index, args=(ctx,))
+    export_thread.start()
+
+    if plan.remove:
+        # No Eclipse build needed for a removal itself — done first so the SAME pass's
+        # batch build below (if any) already reflects the post-removal workspace.
+        apply_removals(ctx, plan)
+
+    batch_targets = plan.open | plan.imports | plan.clean | plan.refresh
+    rebuild_set = set(plan.rebuild)
+    disjoint = bool(rebuild_set) and not (rebuild_set & batch_targets)
+
+    maven_thread = None
+    if plan.rebuild and disjoint:
+        print(f"\nbm-rebuild-module ({len(plan.rebuild)}, parallel — disjoint from the batch):"
+              f" {', '.join(plan.rebuild)}")
+        maven_thread = threading.Thread(target=run_maven, args=(ctx, plan.rebuild, False))
+        maven_thread.start()
+    elif plan.rebuild:
+        print(f"\nbm-rebuild-module ({len(plan.rebuild)}, before the batch — overlaps it):"
+              f" {', '.join(plan.rebuild)}")
+        run_maven(ctx, plan.rebuild, True)
+        plan.refresh |= rebuild_set
+
+    if plan.refresh or plan.open or plan.imports or plan.clean or plan.delete or plan.close:
+        announce_volume(plan)
+        # Lot C: a project just opened from the closed state has a stale resource tree
+        # (its src/ reads as missing) until refreshed — chaining it into the SAME
+        # batch's refresh is free (the batch already suspends auto-build for one
+        # build) and means the 2 phantom errors per opened bundle never appear.
+        refresh_targets = plan.refresh | plan.open
+        args = {"open": sorted(plan.open), "close": sorted(plan.close),
+                "import": sorted(plan.imports), "refresh": sorted(refresh_targets),
+                "clean": sorted(plan.clean), "deleteGenerated": sorted(plan.delete),
+                "build": True}
+        print(f"apply_workspace_batch — delete {len(plan.delete)}, open {len(plan.open)},"
+              f" close {len(plan.close)}, import {len(plan.imports)},"
+              f" refresh {len(refresh_targets)}, clean {len(plan.clean)} (single build)")
+        text, _ = ctx.call("apply_workspace_batch", args)
+        show(ctx, f"apply_workspace_batch — pass {ctx.pass_no}", text)
+        report_deletes(ctx, text)
+
+    if maven_thread is not None:
+        maven_thread.join()
+    export_thread.join()
+
+    if plan.reload_target:
+        print("\nreload_target_platform (a required bundle is neither in the workspace nor on disk)")
+        text, _ = ctx.call("reload_target_platform", {})
+        show(ctx, f"reload_target_platform — pass {ctx.pass_no}", text)
+
+
+def report_deletes(ctx, text):
+    """The only disk write the doctor makes, journalled one file at a time — and every
+    refusal with its reason, because a refused delete is a guard that fired, not noise.
+    Also the batch's own errors[]: report_deletes used to read only 'deleted' and
+    'refusedDeletes', so the two 'delete failed' entries of a real run existed in no
+    record anywhere — they were in the batch's prose output only."""
+    data = mcp.extract_json_block(text) or {}
+    for path in data.get("deleted") or []:
+        emit("deleted", pass_no=ctx.pass_no, path=path)
+    for refusal in data.get("refusedDeletes") or []:
+        emit("delete-refused", pass_no=ctx.pass_no, reason=refusal)
+    for error in data.get("errors") or []:
+        emit("batch-error", pass_no=ctx.pass_no, reason=error)
+
+
+def apply_removals(ctx, plan):
+    """remove_projects is ALL-OR-NOTHING: one guard that fires cancels the whole list.
+    On release/5.6 that meant 10 guarded projects blocking 20 removals that were fine,
+    at all three passes, while the doctor announced 30 removals `resolved` — nothing had
+    been removed at any point. So the refusals are remembered (see Ctx.remove_refused)
+    and the lot is retried ONCE without them, which converges inside the pass instead of
+    asking the next one the same question."""
+    targets = sorted(plan.remove)
+    print(f"\nremove_projects ({len(targets)}): {', '.join(targets)}")
+    text, _ = ctx.call("remove_projects", {"projects": targets})
+    show(ctx, f"remove_projects — pass {ctx.pass_no}", text)
+    removed, refused = report_removals(ctx, text)
+    if removed or not refused:
+        return
+    retry = [t for t in targets if t not in refused]
+    if not retry:
+        return
+    print(f"remove_projects: all-or-nothing refusal on {len(refused)} project(s) —"
+          f" retrying with the other {len(retry)}")
+    text, _ = ctx.call("remove_projects", {"projects": retry})
+    show(ctx, f"remove_projects (retry) — pass {ctx.pass_no}", text)
+    report_removals(ctx, text)
+
+
+def report_removals(ctx, text):
+    """remove_projects' own journal — same shape as report_deletes: a refusal is the
+    guard firing (an unexpected file, an unresolved git status), not noise.
+
+    Returns (removed, refused) as project-name sets, and records them on ctx: the
+    tool's answer is the ONLY thing that says whether a removal happened. A project
+    that is gone has no markers, and neither has one the guard refused to touch, so the
+    error delta a verdict is normally read from is 0 in both cases."""
+    data = mcp.extract_json_block(text) or {}
+    removed, refused = set(), set()
+    for name in data.get("removed") or []:
+        removed.add(name)
+        emit("removed", pass_no=ctx.pass_no, project=name)
+    for reason in data.get("refused") or []:
+        # "<project>: <why>" — a project name never contains a colon.
+        refused.add(str(reason).split(":", 1)[0].strip())
+        emit("remove-refused", pass_no=ctx.pass_no, reason=reason)
+    ctx.removed |= removed
+    ctx.remove_refused |= refused
+    return removed, refused
+
+
+def run_maven(ctx, artifacts, no_refresh):
+    """One reactor for every artifact, bracketed by the informative Eclipse job so the
+    IDE says why nothing is happening. The job holds no scheduling rule and auto-closes,
+    so a kill here cannot leave the workspace or the Progress view stuck.
+
+    no_refresh=True when the caller (apply_plan, overlapping case) folds the refresh
+    into its own single batch; False when the reactor runs disjoint from the batch and
+    has to refresh its own targets itself."""
+    detail = ", ".join(artifacts[:3]) + (f" (+{len(artifacts) - 3})" if len(artifacts) > 3 else "")
+    ctx.call("doctor_status", {"phase": "start", "detail": detail})
+    try:
+        command = [sys.executable, os.path.join(SCRIPT_DIR, "bm-rebuild-module"),
+                   *artifacts, "--config", ctx.config_path]
+        if no_refresh:
+            command.append("--no-refresh")
+        if ctx.out is None:
+            rc = subprocess.call(command)
+        else:
+            # Relaying the whole Maven log is most of a run's stdout. With a report file
+            # it goes there, and the terminal keeps the tail and the status.
+            done = subprocess.run(command, capture_output=True, text=True)
+            rc = done.returncode
+            show(ctx, f"bm-rebuild-module — {detail}", done.stdout + done.stderr, head=0)
+            tail = (done.stdout or "").strip().splitlines()[-8:]
+            for line in tail:
+                print(line)
+        if rc != 0:
+            print("bm-rebuild-module reported failures — see above")
+    finally:
+        ctx.call("doctor_status", {"phase": "end"})
+
+
+def unresolved_name_set(snap, projects):
+    """The set of unresolvedName values among a group of projects' error markers —
+    the identity C2 compares, at constant error count, to tell a real change (a
+    different name now fails) from a genuine fix point (same name, same count)."""
+    names = set()
+    for project in projects:
+        for marker in snap.markers.get(project, []):
+            name = marker.get("unresolvedName")
+            if name and str(marker.get("severity")) == "error":
+                names.add(name)
+    return names
+
+
+def requirers_closure(seeds, snap):
+    """Everything that reaches one of `seeds` through Require-Bundle, transitively — the
+    reverse of require_closure, read off the same PDE graph. Bundle symbolic name and
+    project name are usually equal here but not always, so both are looked up."""
+    reverse = defaultdict(set)
+    for bundle in snap.bundles.values():
+        owner = bundle.get("project") or bundle.get("name")
+        for requirement in bundle.get("requires") or []:
+            name = requirement.get("name")
+            if name and owner:
+                reverse[name].add(owner)
+
+    def keys_for(project):
+        bundle = snap.bundle_of(project)
+        names = {project, bundle.get("name") if bundle else None}
+        names.discard(None)
+        return names
+
+    out = set()
+    seen = set(seeds)
+    queue = deque(seeds)
+    while queue:
+        current = queue.popleft()
+        for key in keys_for(current):
+            for dependent in reverse.get(key, ()):
+                if dependent in seen:
+                    continue
+                seen.add(dependent)
+                out.add(dependent)
+                queue.append(dependent)
+    return out
+
+
+def induced_errors(plan, snap, before, after):
+    """Errors that appeared on projects this pass can itself have knocked out: the ones
+    it touched, plus everything downstream of them through Require-Bundle.
+
+    Cleaning, refreshing or Maven-rebuilding a supplier invalidates its dependents'
+    build state, and their markers are there on the next read. On release/5.6, pass 1
+    rebuilt two `.api` bundles and refreshed 73 projects, then read 723 fresh errors on
+    223 projects it had decided nothing about — every one of them cleared by the next
+    pass with `stale-build-state -> clean`. That is the price of the remedy, not a
+    regression to raise the alarm on, and it is not a `revealed` case either: those
+    projects were in the workspace all along, with zero errors."""
+    seeds = plan.touched() | set(plan.rebuild)
+    scope = seeds | requirers_closure(seeds, snap)
+    return sum(v for p, v in after.items() if v and not before.get(p, 0) and p in scope)
+
+
+def report_outcomes(ctx, plan, before_snap, after_snap):
+    """Tie each remedy to its effect. no-effect is the useful one: it names a (fact,
+    remedy) pair that does not work, so the classification is what needs fixing — not
+    the remedy that needs another try.
+
+    Two rules make the arithmetic mean something:
+
+    - decisions are grouped by (remedy, SET OF AFFECTED PROJECTS), and the targets are
+      joined. A GWT pair used to produce two decisions over the same projects with two
+      targets, so the same markers were summed twice — 18 reported for a real delta of 9;
+    - a project's delta counts in exactly ONE line: the one whose target IS that project
+      when there is one, otherwise the first by order of fact. Without that, a supplier
+      refreshed AND cleaned while its dependents are cleaned recreates the same unreadable
+      count under another name.
+
+    The cohort is the set of projects known at pass entry: a project revealed mid-pass
+    (a bundle just opened, a project just imported) is never allowed to make
+    `unattributed` negative — its errors count as `revealed`, not as a regression of a
+    cohort it was never part of. `blind` decisions (lot B4: applied without a fact) are
+    excluded from `attributed`, on their own line of the arithmetic, because free does
+    not mean credited to a classification.
+
+    Growth INSIDE the cohort is not a regression either when the pass's own remedies
+    explain it: `induced` counts it separately (see induced_errors) and only what is
+    left above it raises `regressed`. release/5.6 flagged a regression on a pass that
+    had done exactly the right thing.
+
+    At constant error count, a group is `no-effect` only if the SET of unresolved
+    names is unchanged too (C2) — a changed set is `progressed`: the classification
+    was right and replaying it was the right call, which is exactly the case the
+    codegen chains got wrong under the old count-only rule. Only a genuine `no-effect`
+    feeds `ctx.no_effect_memory` (C1) — replaying a `progressed` remedy is not what
+    cost the four round-trips on release/5.6."""
+    before = before_snap.errors_by_project()
+    after = after_snap.errors_by_project()
+    per_target = defaultdict(set)
+    facts_by_key = defaultdict(set)
+    blind_by_key = defaultdict(lambda: True)
+    decisions_by_key = defaultdict(list)
+    order = {}
+    for index, decision in enumerate(plan.decisions):
+        per_target[(decision.remedy, decision.target)].add(decision.project)
+        order.setdefault((decision.remedy, decision.target), index)
+
+    groups = {}
+    for (remedy, target), affected in per_target.items():
+        key = (remedy, frozenset(affected))
+        group = groups.setdefault(key, {"remedy": remedy, "affected": set(affected),
+                                        "targets": set(), "order": order[(remedy, target)],
+                                        "decisions": 0})
+        group["targets"].add(target)
+        group["order"] = min(group["order"], order[(remedy, target)])
+    for decision in plan.decisions:
+        key = (decision.remedy, frozenset(per_target[(decision.remedy, decision.target)]))
+        groups[key]["decisions"] += 1
+        facts_by_key[key].add(decision.fact.split(":")[0])
+        blind_by_key[key] = blind_by_key[key] and decision.blind
+        decisions_by_key[key].append(decision)
+
+    lines = sorted(groups.items(), key=lambda kv: (kv[1]["order"], kv[1]["remedy"]))
+
+    # Exclusive attribution, in two passes: a line that targets the project owns it,
+    # otherwise the earliest line by order of fact does. A blind line never wins this
+    # first pass: lot B4 refreshes every errored project, itself included, so a blind
+    # line always "targets the project" — without this exclusion it would steal the
+    # credit from the classified decision that actually explains the delta (e.g. an
+    # `open` of the dependency the project was waiting on, whose target is the
+    # dependency, not the project itself). Blind still gets ownership as the pass-2
+    # fallback when nothing classified touches the project at all.
+    owner = {}
+    for index, (key, group) in enumerate(lines):
+        if blind_by_key[key]:
+            continue
+        for project in sorted(group["affected"]):
+            if project in group["targets"] and project not in owner:
+                owner[project] = index
+    for index, (_, group) in enumerate(lines):
+        for project in sorted(group["affected"]):
+            owner.setdefault(project, index)
+
+    cohort = set(before)
+    verdicts = defaultdict(int)
+    new_no_effect = set()
+    attributed = 0
+    blind = 0
+    for index, (key, group) in enumerate(lines):
+        owned = sorted(p for p in group["affected"] if owner.get(p) == index)
+        errors_before = sum(before.get(p, 0) for p in owned)
+        errors_after = sum(after.get(p, 0) for p in owned if p in cohort)
+        delta = errors_before - errors_after
+        if blind_by_key[key]:
+            blind += delta
+        else:
+            attributed += delta
+        if group["remedy"] == REMEDY_REMOVE:
+            # Read on the tool's answer, never on the delta: a removed project has no
+            # markers, and neither has one the guard refused — 0 -> 0 called every
+            # removal of release/5.6 `resolved` while 0 of 30 had happened.
+            done = {t for t in group["targets"] if t in ctx.removed}
+            verdict = ("resolved" if done == group["targets"]
+                       else "partial" if done else "no-effect")
+        elif not owned:
+            verdict = "not-attributed"
+        elif errors_after == 0:
+            verdict = "resolved"
+        elif errors_after < errors_before:
+            verdict = "partial"
+        elif errors_after == errors_before:
+            same_names = unresolved_name_set(before_snap, owned) == unresolved_name_set(after_snap, owned)
+            verdict = "no-effect" if same_names else "progressed"
+        else:
+            verdict = "regressed"
+        verdicts[verdict] += 1
+        if verdict == "no-effect" and not blind_by_key[key]:
+            for decision in decisions_by_key[key]:
+                if decision.remedy != REMEDY_DELETE:
+                    new_no_effect.add((decision.fact.split(":")[0], decision.remedy, decision.target))
+        emit("outcome", pass_no=ctx.pass_no, remedy=group["remedy"],
+             target=target_label(group["targets"], before), facts=",".join(sorted(facts_by_key[key])),
+             errors_before=errors_before, errors_after=errors_after, verdict=verdict,
+             projects=len(owned), decisions=group["decisions"], blind=blind_by_key[key] or None)
+
+    total_before = sum(before.values())
+    total_after = sum(after.get(p, 0) for p in cohort)
+    revealed = sum(v for p, v in after.items() if p not in cohort)
+    induced = induced_errors(plan, before_snap, before, after)
+    pass_verdict = "regressed" if (total_after - total_before) > induced else None
+    emit("pass", pass_no=ctx.pass_no, errors_before=total_before, errors_after=total_after,
+         attributed=attributed, unattributed=(total_before - total_after) - attributed,
+         revealed=revealed, induced=induced or None, blind=blind or None, verdict=pass_verdict)
+    return verdicts, revealed, blind, pass_verdict, new_no_effect
+
+
+def target_label(targets, before, cap=5):
+    """Joined targets, heaviest first. A synthetic "{n}-projects" label loses the one
+    thing the line is for — which target the delta is attributed to."""
+    ordered = sorted(targets, key=lambda t: (-before.get(t, 0), t))
+    shown = "+".join(ordered[:cap])
+    return shown + (f"+…({len(ordered) - cap} more)" if len(ordered) > cap else "")
+
+
+# --- reporting -----------------------------------------------------------
+
+
+def print_plan(plan, summary):
+    if not plan.decisions and not plan.handoff and not plan.gwt_reported:
+        return
+    if not summary:
+        for project in sorted({d.project for d in plan.decisions}):
+            facts = [d for d in plan.decisions if d.project == project]
+            print(f"{project}")
+            for decision in facts:
+                dep = f" (dep {decision.dep})" if decision.dep and decision.dep != project else ""
+                print(f"  fact:   {decision.fact}{dep}")
+                print(f"  remedy: {decision.remedy} -> {decision.target}")
+            print()
+
+    print("=== Remedy plan (grouped by action) ===")
+    for label, items in (("refresh", sorted(plan.refresh)), ("open", sorted(plan.open)),
+                         ("close", sorted(plan.close)),
+                         ("import", sorted(plan.imports)), ("clean", sorted(plan.clean)),
+                         ("delete-generated", sorted(plan.delete)),
+                         ("rebuild-maven", plan.rebuild)):
+        if items:
+            shown = ", ".join(items[:20]) + (f" (+{len(items) - 20} more)" if len(items) > 20 else "")
+            print(f"- {label}: {shown}")
+    if plan.reload_target:
+        print("- reload_target_platform")
+    if not plan.has_actions():
+        print("- (nothing mechanical)")
+
+    if plan.gwt_reported:
+        print("\n=== ⚠ Possible stale GWT codegen — ONE signal only, not auto-run ===")
+        for api, gwt, signals, hits in plan.gwt_reported:
+            hint = f", {hits} 'abstract method not implemented' error(s)" if hits else ""
+            print(f"- {gwt}: {'+'.join(signals)} (api {api}){hint}")
+        print("  The pair exists and its api is NOT newer than the generated sources: the fix")
+        print("  may be a stale codegen or may be a real code error — ask before forcing:")
+        print("    bm-eclipse-doctor --fix-gwt")
+
+    if plan.handoff:
+        print(f"\n=== Handed back — {len(plan.handoff)} project(s) with unclassified errors ===")
+        for project, markers in sorted(plan.handoff.items()):
+            shapes = defaultdict(int)
+            for marker in markers:
+                shapes[message_shape(marker.get("message", ""))] += 1
+            top = sorted(shapes.items(), key=lambda kv: -kv[1])[:3]
+            print(f"- {project} ({len(markers)} error(s)): "
+                  + "; ".join(f"{count}× {shape}" for shape, count in top))
+
+
+def print_facts(ctx, snap):
+    """--report: the facts of the projects a reader needs to situate the run — the ones
+    in error, the ones cited as suppliers, and every bundle unresolved or with invisible
+    metadata. --report-all-facts prints the whole workspace (1300+ lines, ~200 Kb);
+    what is healthy AND unrelated is not what makes an unhealthy project readable."""
+    interesting = None
+    if not ctx.all_facts:
+        interesting = set(snap.errored_projects())
+        for entry in snap.unresolved_types.values():
+            interesting |= set(entry.get("diskProjects") or [])
+            interesting |= set(entry.get("jdtProjects") or [])
+            interesting |= set(entry.get("requestedBy") or [])
+
+    for name in sorted(snap.projects):
+        info = snap.projects[name]
+        bundle = snap.bundle_of(name) or {}
+        invisible = bundle.get("metadataInvisible")
+        if interesting is not None and name not in interesting:
+            if bundle.get("resolved") is not False and not invisible:
+                continue
+        # list_projects falls back to the absolute location for a project outside the
+        # repo root. A report has to be transmissible as-is, so that path is dropped
+        # rather than printed — no /home/<user> anywhere in the output.
+        path = info.get("path")
+        path = "(outside repo root)" if path and path.startswith("/") else path
+        emit("fact", pass_no=ctx.pass_no, project=name, path=path,
+             open=info.get("open"), errors=info.get("errors"), warnings=info.get("warnings"),
+             source=bundle.get("source"), resolved=bundle.get("resolved"),
+             resolver_errors=len(bundle.get("resolverErrors") or []),
+             metadata_invisible=",".join(invisible) if invisible else None)
+
+
+def print_unresolved(ctx, snap):
+    """--report: one line per distinct missing name — the machine-readable version of a
+    table that had to be written by hand on 2026-07-27."""
+    for name in sorted(snap.unresolved_types):
+        entry = snap.unresolved_types[name]
+        providers = entry.get("diskProjects") or entry.get("jdtProjects") or []
+        emit("unresolved", pass_no=ctx.pass_no, name=name, kind=entry.get("kind"),
+             provider=",".join(providers[:3]) if providers else None,
+             tracked=entry.get("tracked"), requested_by=len(entry.get("requestedBy") or []))
+    if snap.unresolved_truncated:
+        emit("unresolved-truncated", pass_no=ctx.pass_no, cap=len(snap.unresolved_types))
+
+
+def branch_change_hint(ctx, snap):
+    """Indicative only: a workspace missing many on-disk projects looks like a branch
+    change. Say so, suggest --sync, never run it."""
+    missing = [name for name in ctx.disk if name not in snap.projects]
+    if len(missing) < 10:
+        return
+    print(f"\nNote: {len(missing)} project(s) are on disk but not in the workspace"
+          " — this looks like a branch change. `bm-eclipse-doctor --sync --apply` would import"
+          " them and reorganise the working sets. Not doing it on my own.")
+
+
+# --- the loop ------------------------------------------------------------
+
+
+def run_sync(ctx, apply_changes):
+    print("=== --sync: aligning the workspace with the disk first ===")
+    print("(the sync changes the set of projects, so it runs BEFORE the diagnostic)")
+    text, _ = ctx.call("sync_projects", {"apply": apply_changes, "removeObsolete": True})
+    show(ctx, "sync_projects", text)
+    text, _ = ctx.call("sync_working_sets", {"apply": apply_changes})
+    show(ctx, "sync_working_sets", text)
+
+
+def fetch_projects(ctx):
+    text, is_error = ctx.call("list_projects", {"scope": "all"}, phase="list_projects")
+    if is_error:
+        mcp.die(f"list_projects failed:\n{text}")
+    data = mcp.extract_json_block(text)
+    if data is None:
+        mcp.die("no json block found in list_projects report")
+    return data.get("projects", [])
+
+
+def fetch_repo_root(ctx):
+    """Repo root on disk, for plan_focus's manifest reads — a cheap doctor_snapshot
+    (waitForBuild=False), since --focus needs this BEFORE the shape change, well
+    before main()'s own repo_root/disk scan (which rides the real, post-shape
+    diagnostic read)."""
+    text, is_error = ctx.call("doctor_snapshot", {"severity": ctx.severity, "waitForBuild": False},
+                              phase="doctor_snapshot (repo root for --focus)")
+    if is_error:
+        return None
+    data = mcp.extract_json_block(text)
+    if data is None:
+        return None
+    return (data.get("workspace") or {}).get("repoRoot")
+
+
+def run_workspace_shape(ctx, args, apply_changes):
+    """Apply the requested open/close/group/focus, AFTER --sync (a name can target a
+    project --sync just imported) and BEFORE the diagnostic snapshot that feeds --apply's
+    repair loop (see the module docstring): repairing against a shape about to change
+    wastes decisions on projects headed for closure, and stays blind to whatever the
+    projects being opened are about to reveal.
+
+    --focus is exclusive with the rest (validated in main()); --open/--close/
+    --open-group/--close-group compose into one apply_workspace_batch. Registers the
+    close set as ctx.protected_closed and the open set as ctx.protected_open so the
+    repair loop that follows never silently undoes what was just asked for (see
+    classify()'s closed_roots handling).
+
+    --focus additionally needs the repo root before it can plan anything (to read
+    closed candidates' MANIFEST.MF and keep their own dependencies out of its close
+    set — see the module docstring) — a cheap doctor_snapshot(waitForBuild=False),
+    well before the real one below."""
+    if not (args.open or args.close or args.open_group or args.close_group or args.focus):
+        return
+
+    projects = fetch_projects(ctx)
+    open_names, close_names = set(), set()
+    protected_open, protected_closed = set(), set()
+
+    if args.focus:
+        names = ws.split_names(args.focus)
+        root = fetch_repo_root(ctx)
+        if root is None:
+            print("Focus: could not read the repo root — closing down to exactly the"
+                  " named set, with no dependency closure (a provider the focus target"
+                  " needs may end up closed and protected).")
+        unknown, to_open, to_close = ws.plan_focus(names, projects, root)
+        if unknown:
+            print(f"Focus: not in workspace, left out: {', '.join(unknown)}")
+        open_names |= set(to_open)
+        close_names |= set(to_close)
+        protected_open |= set(names) - set(unknown)
+        protected_closed |= set(to_close)
+    else:
+        if args.open:
+            names = ws.split_names(args.open)
+            unknown, _already, to_open = ws.plan_open(names, projects)
+            if unknown:
+                print(f"Not in workspace: {', '.join(unknown)}")
+            open_names |= set(to_open)
+            protected_open |= set(names) - set(unknown)
+        if args.close:
+            names = ws.split_names(args.close)
+            unknown, _already, to_close = ws.plan_close(names, projects)
+            if unknown:
+                print(f"Not in workspace: {', '.join(unknown)}")
+            close_names |= set(to_close)
+            protected_closed |= set(names) - set(unknown)
+        if args.open_group:
+            matched, to_open = ws.plan_open_group(args.open_group, projects)
+            open_names |= set(to_open)
+            # The whole group is the ask, not just the members that needed opening —
+            # an already-open member is still "wanted open" for the conflict check below.
+            protected_open |= {p["name"] for p in matched}
+        if args.close_group:
+            matched, to_close = ws.plan_close_group(args.close_group, projects)
+            close_names |= set(to_close)
+            protected_closed |= {p["name"] for p in matched}
+
+    # Checked on the REQUESTED names, not on open_names/close_names: a project is
+    # either open or closed at snapshot time, never both, so those two action sets
+    # can never overlap by construction — that would never catch the actual mistake
+    # (asking to open and close the very same name), only ever the state it happened
+    # to already be in.
+    overlap = protected_open & protected_closed
+    if overlap:
+        mcp.die(f"asked to both open and close: {', '.join(sorted(overlap))}")
+
+    print(f"\n=== workspace shape: opening {len(open_names)}, closing {len(close_names)} ===")
+    if open_names:
+        ws.print_capped("Would open" if not apply_changes else "Opening", sorted(open_names))
+    if close_names:
+        ws.print_capped("Would close" if not apply_changes else "Closing", sorted(close_names))
+
+    if not apply_changes:
+        print("\nDry-run — pass --apply to change the workspace shape.")
+        return
+
+    ctx.protected_open = protected_open
+    ctx.protected_closed = protected_closed
+    if not (open_names or close_names):
+        print("Nothing to open or close.")
+        return
+    text, _ = ctx.call("apply_workspace_batch",
+                       {"open": sorted(open_names), "close": sorted(close_names)})
+    show(ctx, "workspace_shape", text)
+
+
+def handoff_totals(plan):
+    if not plan:
+        return 0, 0
+    return len(plan.handoff), sum(len(m) for m in plan.handoff.values())
+
+
+def repair_loop(ctx, snap, summary):
+    """Fix-point loop. Each pass: one batch of workspace remedies, one Maven reactor,
+    one re-read. Stop as soon as a pass neither reduced the error count nor changed the
+    plan — replaying an ineffective remedy is what cost 4 round-trips on 2026-07-24."""
+    initial_errors = snap.error_count
+    passes = 0
+    totals = defaultdict(int)
+    plan = None
+    revealed_total = 0
+    blind_total = 0
+    pass_regressions = 0
+
+    while ctx.pass_no < MAX_PASSES:
+        ctx.pass_no += 1
+        passes = ctx.pass_no
+        print(f"\n=== pass {ctx.pass_no} ===")
+        if ctx.report:
+            print_facts(ctx, snap)
+            print_unresolved(ctx, snap)
+        plan = classify(ctx, snap)
+        print_plan(plan, summary)
+
+        if not plan.has_actions():
+            print("\nNothing mechanical left to do.")
+            break
+
+        before = snap.errors_by_project()
+        signature = plan.signature()
+        apply_plan(ctx, plan)
+
+        after_snap = read_snapshot(ctx, extra_bundles=suspect_bundles(plan))
+        after = after_snap.errors_by_project()
+        verdicts, revealed, blind, pass_verdict, new_no_effect = report_outcomes(ctx, plan, snap, after_snap)
+        ctx.no_effect_memory |= new_no_effect
+        for verdict, count in verdicts.items():
+            totals[verdict] += count
+        revealed_total += revealed
+        blind_total += blind
+        if pass_verdict == "regressed":
+            pass_regressions += 1
+        print(f"pass {ctx.pass_no}: errors {snap.error_count} -> {after_snap.error_count},"
+              f" {len(plan.handoff)} project(s) handed back,"
+              f" verdicts {dict(sorted(verdicts.items()))}"
+              + (f", revealed {revealed}" if revealed else "")
+              + (f", blind {blind}" if blind else ""))
+        if pass_verdict == "regressed":
+            print(f"⚠ pass {ctx.pass_no}: the known cohort regressed (errors {sum(before.values())}"
+                  f" -> {sum(after.get(p, 0) for p in before)}) — neither a revealed project nor"
+                  " collateral of this pass's own remedies.")
+
+        if after_snap.error_count == 0:
+            snap = after_snap
+            break
+
+        with quiet():
+            next_plan = classify(ctx, after_snap)
+        if after_snap.error_count >= snap.error_count and next_plan.signature() == signature:
+            print("\nStopping: this pass did not reduce the error count and the next pass would"
+                  " do exactly the same thing. Re-running it would not help — the classification"
+                  " is what needs a look (see the no-effect lines above).")
+            snap = after_snap
+            plan = next_plan
+            break
+        snap = after_snap
+
+    # The hand-off publishes ONLY here, on the final plan (lot D1): pass 1 of the
+    # cyrusspool run announced "363 errors handed back on 9 projects" with 3 actually
+    # left, because every pass used to report its own, still-provisional hand-off.
+    report_handoff(ctx, plan)
+    handoff_projects, handoff_errors = handoff_totals(plan)
+    # Final partition, not the first pass's: the same root counted decided AND handed
+    # back across passes is what put 118 in the report for 111 errors actually moved.
+    decided_errors = initial_errors - handoff_errors
+    guarded_projects = len(plan.guarded)
+    guarded_errors = sum(len(plan.handoff.get(p, [])) for p in plan.guarded) if plan.guarded else 0
+    emit("end", passes=passes, errors_before=initial_errors, errors_after=snap.error_count,
+         handoff_projects=handoff_projects, handoff_errors=handoff_errors,
+         decided_errors=decided_errors, no_effect=totals.get("no-effect", 0),
+         regressed=totals.get("regressed", 0), revealed=revealed_total or None,
+         blind=blind_total or None, pass_regressions=pass_regressions or None,
+         guarded_errors=guarded_errors or None, guarded_projects=guarded_projects or None)
+    if plan.guarded:
+        reasons = names_label(set(plan.guarded.values()), cap=3)
+        print(f"\n⚠ {guarded_errors} erreur(s) rendues sont expliquées mais bloquées par une garde"
+              f" ({guarded_projects} projet(s)) : {reasons}")
+    return snap, plan
+
+
+def suspect_bundles(plan):
+    """Bundles worth looking up beyond the workspace models on the next read: the ones
+    a remedy just touched, plus the ones PDE did not know about."""
+    return (set(plan.refresh) | set(plan.open) | set(plan.imports) | set(plan.rebuild)
+            | set(plan.close))
+
+
+def fix_gwt(ctx, plan):
+    """Explicit forcing for the one-signal GWT findings: rebuild every flagged api and
+    api.gwt in one reactor. Never part of --apply — one signal is not proof.
+
+    Its scope SHRANK with the three pairing states: only a real `paired` pair whose
+    freshness signal is absent lands here. A project with no counterpart is not a
+    doubt to force, it is a different question."""
+    if not plan.gwt_reported:
+        print("\n=== --fix-gwt: no possible stale GWT codegen detected ===")
+        return
+    artifacts = []
+    for api, gwt, _, _ in plan.gwt_reported:
+        for artifact in (api, gwt):
+            if artifact and artifact not in artifacts:
+                artifacts.append(artifact)
+    print(f"\n=== --fix-gwt: rebuilding {len(plan.gwt_reported)} pair(s) in one reactor ===")
+    print(f"artifacts: {', '.join(artifacts)}")
+    run_maven(ctx, artifacts, False)
+    after = read_snapshot(ctx)
+    print(f"\nAfter --fix-gwt: {after.error_count} error(s) left.")
+
+
+def main():
+    global _RECORDER
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--severity", choices=["error", "warning", "all"], default="error")
+    ap.add_argument("--json", action="store_true", help="print the raw snapshot facts and exit")
+    ap.add_argument("--summary", action="store_true", help="print only the grouped remedy plan")
+    ap.add_argument("--apply", action="store_true",
+                    help="repair: loop batch/rebuild/re-read until the fix point (max 4 passes)")
+    ap.add_argument("--sync", action="store_true",
+                    help="align the workspace with the disk (projects + working sets) before"
+                         " repairing; with --apply it actually applies the sync")
+    ap.add_argument("--open", help="Comma-separated exact project names to open before"
+                    " diagnosing/repairing (after --sync). Composes with --close/"
+                    " --open-group/--close-group.")
+    ap.add_argument("--close", help="Comma-separated exact project names to close before"
+                    " diagnosing/repairing (after --sync). Protected for the rest of the"
+                    " run — see the module docstring. Composes with --open/--open-group/"
+                    " --close-group.")
+    ap.add_argument("--open-group", choices=sorted(ws.GROUPS),
+                    help="Open every closed project in a named group before repairing.")
+    ap.add_argument("--close-group", choices=sorted(ws.GROUPS),
+                    help="Close every open project in a named group before repairing.")
+    ap.add_argument("--focus", help="Comma-separated project names to keep open; every"
+                    " other open project is closed, before repairing. Exclusive with"
+                    " --open/--close/--open-group/--close-group.")
+    ap.add_argument("--fix-gwt", action="store_true",
+                    help="explicit forcing: rebuild the api+api.gwt pairs flagged on a single"
+                         " GWT signal, in one reactor. Never part of --apply.")
+    ap.add_argument("--report", action="store_true",
+                    help="report-quality output: per-call timings, the facts of the projects in"
+                         " error and of the suppliers they cite, one line per unresolved type,"
+                         " and the rejected candidates of each decision. Writes no file.")
+    ap.add_argument("--report-all-facts", action="store_true",
+                    help="with --report, print the facts of EVERY project (1300+ lines)")
+    ap.add_argument("--report-out", metavar="PATH",
+                    help="the only way this script writes a file: a markdown summary at PATH and"
+                         " the structured records next to it as .jsonl. The Maven and batch"
+                         " output goes there too, leaving the summary in the terminal.")
+    ap.add_argument("bundle_hint", nargs="?", default=None)
+    ap.add_argument("--config", help="MCP config file path (overrides discovery)")
+    args = ap.parse_args()
+
+    if args.focus and (args.open or args.close or args.open_group or args.close_group):
+        mcp.die("--focus is exclusive with --open/--close/--open-group/--close-group")
+
+    config_path = mcp.pick_config(args.config, args.bundle_hint)
+    tools = mcp.list_tools(config_path)
+    if tools is None:
+        mcp.die(f"Eclipse MCP at {config_path} is not reachable — is Eclipse running?")
+    missing = sorted(set(REQUIRED_TOOLS) - {t.get("name") for t in tools})
+    if missing:
+        # The contract is the presence of the tools, never a version number: a plugin
+        # rebuilt from this branch exposes them, an older one does not.
+        mcp.die("the running Eclipse plugin does not expose " + ", ".join(missing)
+                + "\n       it is older than this branch — rebuild net.bluemind.devtools,"
+                  " reinstall it and restart Eclipse")
+
+    out = Report(args.report_out) if args.report_out else None
+    _RECORDER = out
+    ctx = Ctx(config_path, args.severity, args.report or bool(out), out, args.report_all_facts)
+
+    if args.sync:
+        run_sync(ctx, args.apply)
+
+    run_workspace_shape(ctx, args, args.apply)
+
+    snap = read_snapshot(ctx)
+    ctx.repo_root = snap.workspace.get("repoRoot")
+    ctx.disk = scan_disk_projects(ctx.repo_root)
+
+    emit("run", script=SCRIPT_VERSION, plugin=snap.workspace.get("pluginVersion"),
+         branch=snap.workspace.get("branch"), projects_open=snap.workspace.get("openProjects"),
+         projects_closed=snap.workspace.get("closedProjects"), errors=snap.error_count,
+         warnings=snap.warning_count, projects_in_error=len(snap.errored_projects()),
+         settled=snap.settled, settle_rounds=snap.settle_rounds,
+         severity=args.severity, mode="apply" if args.apply else "diagnose")
+    if snap.settled is False:
+        print("\nNote: the workspace was still refreshing or building when the markers were read"
+              " (settled=false). The error count may not be stable — re-run the diagnostic if it"
+              " looks inconsistent.")
+
+    if args.json:
+        print(json.dumps(snap.raw, indent=2))
+        return 0
+
+    plan = None
+    if snap.error_count == 0:
+        print("No compile errors.")
+        branch_change_hint(ctx, snap)
+        emit("end", passes=0, errors_before=0, errors_after=0, handoff_projects=0,
+             handoff_errors=0, decided_errors=0)
+    elif args.apply:
+        snap, plan = repair_loop(ctx, snap, args.summary)
+        if snap.error_count:
+            print(f"\n{snap.error_count} error(s) left. Read the [doctor:outcome] lines before"
+                  " retrying anything: a remedy marked no-effect means the classification is"
+                  " wrong, not that the remedy needs another go.")
+    else:
+        ctx.pass_no = 1
+        if ctx.report:
+            print_facts(ctx, snap)
+            print_unresolved(ctx, snap)
+        plan = classify(ctx, snap)
+        report_handoff(ctx, plan)  # single pass here, so this IS the final plan (lot D1)
+        print_plan(plan, args.summary)
+        branch_change_hint(ctx, snap)
+        handoff_projects, handoff_errors = handoff_totals(plan)
+        emit("end", passes=0, errors_before=snap.error_count, errors_after=snap.error_count,
+             handoff_projects=handoff_projects, handoff_errors=handoff_errors,
+             decided_errors=0)
+
+    if args.fix_gwt and plan is not None:
+        fix_gwt(ctx, plan)
+
+    if out is not None:
+        out.write(snap, args)
+        print(f"\nReport written:\n  {out.md_path}\n  {out.jsonl_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+"""bm-eclipse-status — Eclipse MCP connectivity check across all instances.
+
+Lists every Eclipse MCP instance discovered under ~/.config/bluemind/mcp
+(eclipse-*.json), checks each is reachable (tools/list) and, with --projects,
+lists the projects of each reachable workspace. Read-only.
+
+Usage:
+  bm-eclipse-status [--projects] [--config PATH]
+"""
+import argparse
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _eclipse_mcp as mcp
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--projects", action="store_true", help="also list projects per reachable workspace")
+    ap.add_argument("--config", help="check only this config file instead of discovering all instances")
+    args = ap.parse_args()
+
+    configs = [args.config] if args.config else mcp.find_configs()
+    if not configs:
+        print(f"No Eclipse MCP config found in {mcp.CONFIG_DIR}")
+        print("Is Eclipse running with the BlueMind Dev Tools plugin?")
+        return 1
+
+    print(f"Found {len(configs)} Eclipse instance(s):\n")
+    any_ok = False
+    for cfg_path in configs:
+        cfg = mcp.load_config(cfg_path)
+        name = os.path.splitext(os.path.basename(cfg_path))[0]
+        print(f"  [{name}]")
+        print(f"    url:       {cfg.get('url', '?')}")
+        print(f"    workspace: {cfg.get('workspace', '?')}")
+
+        tools = mcp.list_tools(cfg_path)
+        if tools is None:
+            print("    status:    UNREACHABLE\n")
+            continue
+        any_ok = True
+        print(f"    status:    OK ({len(tools)} tools available)")
+
+        if args.projects:
+            text, _ = mcp.call(cfg_path, "list_projects", {"scope": "all"})
+            print("    projects:")
+            for line in text.splitlines()[:30]:
+                print(f"      {line}")
+        print()
+
+    return 0 if any_ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -30,6 +30,8 @@ Contenu :
   "authHeader": "Authorization",
   "authScheme": "Bearer",
   "workspace":  "/chemin/absolu/du/workspace/eclipse",
+  "repoRoot":   "/chemin/absolu/du/repo BlueMind (racine, dérivée du POM global)",
+  "branch":     "nom-de-la-branche-git-courante",
   "projects":   ["net.bluemind.foo", "net.bluemind.foo.tests", "..."],
   "pid":        12345,
   "writtenAt":  1745280000000
@@ -216,3 +218,141 @@ url+token), `icr_call.sh <tool> [json]` (appel générique : `icr_start`, `icr_n
 `icr_poll.sh` (long-poll en tâche de fond) et `icr_reply.sh <threadId> <fichier>` (réponse lue depuis
 un fichier). Le curl/jq inline ou une fonction shell autour de curl se font bloquer par l'heuristique
 d'obfuscation de Claude Code et coûtent beaucoup plus de tokens.
+
+## 6. Gestion du workspace (sync projets, working sets, doctor)
+
+Le même serveur MCP expose des outils pour maintenir le workspace Eclipse aligné sur le disque et
+diagnostiquer les erreurs de compilation.
+
+**Alignement disque ↔ workspace :**
+
+| Tool                 | Arguments                                              | Description                                                          |
+|----------------------|---------------------------------------------------------|-----------------------------------------------------------------------|
+| `sync_projects`      | `path?`, `apply?` (déf. false), `removeObsolete?` (déf. true) | Diff disque ↔ workspace : à importer / obsolètes / déplacés. Dry-run par défaut |
+| `list_projects`      | `scope?` (`all`/`errors`/`closed`)                     | Lecture seule : chemin relatif au repo, ouvert/fermé, working sets, erreurs/warnings, **`tracked`** (au moins un fichier suivi par git sous le répertoire — `null` si le statut git n'a pas pu être résolu) (bloc JSON complet) |
+| `workspace_info`     | —                                                       | Repo root, branche git courante, chemin workspace — utile en multi-instance |
+| `sync_working_sets`  | `path?`, `apply?` (déf. false), `reset?` (déf. false), `layout?` (`flat2`/`flat3`/`hybrid`, déf. `hybrid`) | Working sets d'après l'arbo. `layout` : `flat2` (2 niveaux, `open/parent` énorme), `flat3` (3 niveaux), `hybrid` (2 niveaux sauf `open/parent` en 3, queues < 5 projets dans `open/parent/~misc`). Ne touche jamais un set fait main. `reset` supprime tout et recrée |
+
+**Diagnostic / réparation de compilation :**
+
+| Tool                    | Arguments                                              | Description                                                          |
+|-------------------------|---------------------------------------------------------|-----------------------------------------------------------------------|
+| `get_problems`          | `projects?`, `severity?`, `waitForBuild?` (déf. false) | Marqueurs JDT/PDE. Lecture seule (ne build pas). `waitForBuild` attend que le workspace cesse de rafraîchir **et** de builder → snapshot fiable. Renvoie **tous** les marqueurs dans un bloc JSON (le markdown est plafonné), chacun avec `problemId` (l'`IProblem`), `problemKind` (`undefined-type`, `import-not-found`, `undefined-name`, `abstract-method-not-implemented`, `classpath-incorrect`, `hierarchy-has-problems`, `missing-type-in-signature`, `other`) et `unresolvedName` (le nom manquant, non traduit — premier argument du problème, ou **dernier** pour `missing-type-in-signature`, dont l'argument 0 est le type déclarant) — **plus aucune raison de parser un message** |
+| `get_build_status`      | —                                                       | Eclipse est-il occupé ? Compte les jobs des quatre familles (refresh manuel/auto, build manuel/auto) et renvoie `settled` + `activeFamilies`. Point de synchro avant `get_problems` |
+| `get_bundle_state`      | `bundles?`                                              | **La vérité terrain PDE.** Par bundle : `source` (`workspace`/`target`), `resolved`, `resolverErrors` (`MISSING_REQUIRE_BUNDLE`, `MISSING_IMPORT_PACKAGE`, `SINGLETON_SELECTION`, …), `requires` (plages de versions et `reexport` déjà résolus), et **`metadataInvisible`** : les métadonnées PDE présentes sur disque mais absentes de la vue Eclipse. Un nommé pour lequel `PluginRegistry` n'a pas de modèle mais qui existe **fermé** dans le workspace sort `source: workspace, closed: true` plutôt que dans `unknown` — fermé n'est pas « ni workspace ni target ». Sans `bundles` : les modèles du workspace, sans les `exports`. Avec `bundles` : la recherche où qu'ils soient, `exports`/`imports` inclus |
+| `locate_type`           | `names`                                                 | **Où vit un type ?** Par nom : `jdt-visible` (le modèle JDT le connaît → l'arbre de ressources est bon, seul l'état de build est périmé), `disk-only` (`<Nom>.java` est dans un dossier source d'un projet ouvert mais JDT ne le voit pas → arbre désynchronisé du disque), `closed-provider` (`<Nom>.java` est dans un dossier source d'un projet **fermé** → le type existe, on ne le regarde juste pas ; ouvrir le fournisseur) ou `nowhere` (ni JDT, ni le disque d'un projet ouvert, ni celui d'un fermé — vraie erreur de code, ou sortie de codegen dont l'entrée a disparu). Plus `jdtProjects`, `diskProjects`, `diskPath` (relatif à la racine repo) et `tracked` (suivi par git). Attend l'indexeur JDT avant de répondre |
+| `doctor_snapshot`       | `severity?`, `waitForBuild?` (déf. true), `bundles?`   | Agrégat lecture seule pour le doctor : `workspace_info` + `get_problems` + `list_projects` + `get_bundle_state` en **un** bloc JSON, donc un aller-retour au lieu de quatre (MCP sérialise). Ajoute `unresolvedTypes` (chaque nom distinct qu'un marqueur d'erreur ne résout pas, localisé comme `locate_type`, dédupliqué, plafonné à 200 avec `unresolvedTypesTruncated`) et `settled` / `settleRounds` (le workspace était-il vraiment au repos à la lecture des marqueurs). Faits purs, aucun verdict |
+| `open_projects`         | `projects`                                              | Ouvre des projets fermés + build incrémental + rapport d'erreurs |
+| `close_projects`        | `projects`                                              | Miroir d'`open_projects` : ferme des projets ouverts + build incrémental (pour que les dépendants voient le fournisseur désormais fermé). Aucun contenu disque touché, aucun consentement demandé (comme `open_projects`) — état IDE local, trivialement réversible |
+| `remove_projects`       | `projects`                                              | Retire des projets du workspace **et supprime leur résidu disque** (`.project`, `.classpath`, `.settings/`, `bin/`, `target/`) — seule exception à « jamais de contenu disque supprimé ». Tout ou rien : refuse la liste entière si un projet a au moins un fichier suivi par git (ou statut git non résolu) ou du contenu au-delà de ce résidu. Consentement requis (`workspace.consent.projects`) |
+| `reload_target_platform`| —                                                       | Recharge/re-résout la target platform active (après changement de la définition ou du repo p2) |
+| `clean_projects`        | `projects?`, `build?` (déf. true)                       | Project > Clean : purge l'état de build et reconstruit |
+| `import_projects`       | `path?`                                                 | Importe les projets Eclipse présents sur disque et absents du workspace |
+| `apply_workspace_batch` | `open?`, `close?`, `import?`, `refresh?`, `clean?`, `deleteGenerated?`, `path?`, `build?` (déf. true) | Batch atomique du doctor : suspend l'auto-build, puis en **une** opération workspace supprime / ouvre / ferme / importe / refresh, puis clean et **un seul** build, et restaure l'auto-build. Consentement requis **seulement** si `open` ou `import` est non vide — `close` suit `close_projects` : aucun consentement, état IDE local trivialement réversible. `deleteGenerated` est **tout ou rien** : chaque chemin doit être sous un `kind="src"` généré de son projet, non suivi par git et sous la racine repo — un seul échec annule toute la liste, et rien n'est supprimé (`deleted` / `refusedDeletes` en sortie) |
+| `doctor_status`         | `phase` (`start`/`end`), `detail?`                      | Entrée de progression purement informative pendant un rebuild Maven **externe**. Aucune règle d'ordonnancement (ne verrouille pas le workspace), non annulable utilement, auto-fermeture au bout de 20 min |
+| `check_pom_sync`        | —                                                       | Même comparaison que le menu **BlueMind → Check POM Sync...**, lecture seule (n'applique jamais rien). Compare les arguments VM du JRE par défaut du workspace et l'emplacement de la target platform au `global/pom.xml` (`tycho.testArgLine` résolu, `docker.devenv.tag`, `target-platform-version`) : `inSync`, `vmArgsMismatch`, `targetPlatformMismatch`, plus les valeurs résolues des deux côtés (`workspaceVmArgs`, `pomResolvedTestArgLine`, ...) pour diagnostiquer sans ouvrir le dialogue. Un lancement de test qui tourne silencieusement avec des args VM périmés (un vieux `docker.devenv.tag`, un flag ajouté depuis) ressemble à un vrai échec de test sinon. `notABlueMindWorkspace: true` si aucun projet ouvert n'a `global/pom.xml` dans son ascendance |
+
+`sync_projects`, `sync_working_sets` et `apply_workspace_batch` en mode `apply` sont protégés par un consentement
+utilisateur — préférences **`workspace.consent.projects`** / **`workspace.consent.workingsets`**
+(`ask` / `always` / `never`, **Window → Preferences → BlueMind**). En mode `ask`, une boîte de
+dialogue Eclipse apparaît (timeout 60 s = refus ponctuel, sans modifier la préférence) ; le choix
+vaut pour toute la session Eclipse, et peut être mémorisé de façon permanente via la case à cocher.
+Le contenu disque n'est en général jamais touché : un projet obsolète est retiré du workspace
+(`deleteContent=false`), jamais supprimé. Seule exception : `remove_projects`, sur un projet dont
+**aucun fichier de tout le sous-arbre** n'est suivi par git et dont le contenu ne dépasse pas le
+résidu Eclipse/Maven attendu — alors `deleteContent=true`, avec consentement.
+
+Le consentement d'`apply_workspace_batch` est **conditionnel** : il n'est demandé que si `open` ou
+`import` est non vide. `refresh_projects` et `clean_projects` ne sont gardés par rien quand on les
+appelle seuls — et à juste titre : ils invalident de l'état de build, ils ne changent pas
+l'appartenance au workspace. Les router à travers le batch ne doit pas les faire passer sous un
+consentement dont ils n'ont pas besoin.
+
+`apply_workspace_batch` suspend l'auto-build pour ouvrir/importer un lot puis faire **un seul** build,
+et le restaure toujours — dans un `try/finally`, plus un filet au `start()`/`stop()` du plugin qui
+relit la préférence **`workspace.autobuild.saved`** (valeur d'auto-build sauvegardée avant suspension)
+pour ne jamais laisser le workspace avec l'auto-build coupé après un crash en plein batch.
+
+Scripts (`.claude/scripts/eclipse/`, installés comme les scripts ICR — cf. README). L'entrée
+principale pour un triage est **`bm-eclipse-doctor`**, qui classe chaque projet en erreur **par un
+fait** (pas par un symptôme ni par la forme d'un message), lu dans `doctor_snapshot` :
+
+| Fait | Remède |
+|---|---|
+| `metadataInvisible` non vide | `refresh` de la dépendance |
+| Absente du workspace, `.project` sur disque | `import` |
+| Fermée | `open`, tout le transitif, sans plafond de rayon — son `refresh` est chaîné dans le **même** batch (sinon un projet rouvert lit son `src/` comme manquant jusqu'à la passe suivante) |
+| Dossier source déclaré manquant/vide | rebuild Maven |
+| `resolved: true` mais le dépendant a toujours ses marqueurs | `clean` du dépendant |
+| Ni workspace ni disque | `reload_target_platform` |
+| Type non résolu, `jdt-visible` | `clean` du dépendant |
+| Type non résolu, `disk-only` | `refresh` + `clean` du fournisseur, `clean` du dépendant |
+| Type non résolu, `closed-provider` | `open` du fournisseur (même mécanisme que « Fermée » ci-dessus) |
+| Type non résolu, `nowhere`, dans un dossier généré, non suivi par git | suppression du paquet entier (pas seulement les fichiers de même préfixe) + `clean` |
+| `Import-Package` non résolu, fournisseur trouvé dans l'index `Export-Package` (disque) | même traitement qu'un `Require-Bundle` non résolu (`open`/`refresh`/etc. sur le fournisseur) |
+| Projet sans aucun fichier suivi par git dans tout son sous-arbre | `remove-project` (retrait workspace + résidu disque) — vérifié en premier, avant tout autre fait du projet |
+| Marqueur JDT « build path is incomplete » | fait nommé `broken-classpath`, **hand-off explicite, jamais de remède automatique** |
+| Aucun des précédents | vraie erreur de code → hand-off |
+
+Une cascade produit **une** décision sur la racine : le graphe des bundles non résolus est remonté
+jusqu'à ses feuilles avant de décider. Les quatre faits « type non résolu » viennent d'`unresolvedTypes`,
+donc du plugin, et pas d'une heuristique du script ; le fournisseur retenu doit être dans la
+fermeture `Require-Bundle` du demandeur, sinon le cas sort nommé
+(`source-invisible-out-of-closure`) au lieu d'un refresh sur un homonyme.
+
+Le codegen GWT périmé est invisible à PDE (les deux bundles restent *resolved*, l'erreur est une
+erreur JDT dans les sources générées) et se décide sur deux signaux déterministes : marqueur dans un
+dossier source **généré**, et sources de l'`.api` plus récentes que les sources générées du `.gwt`.
+Le pairage a **trois** états : `paired` + fraîcheur → rebuild automatique de la paire ; `paired`
+sans fraîcheur → rapport et `--fix-gwt` sur demande ; `no-counterpart` → la question ne se pose pas,
+donc jamais `report-only` (codegen orphelin ou hand-off).
+
+Options : `--apply` (boucle jusqu'au point fixe, 4 passes max ; par passe **un** réacteur Maven et
+**un** build Eclipse — le réacteur passe avant le batch et s'y plie s'ils se recoupent, sinon tourne
+en parallèle du batch dans un thread ; arrêt immédiat si une passe ne réduit pas le nombre d'erreurs
+et que le plan ne change pas ; jamais de modif de code versionné), `--sync` (`sync_projects` puis
+`sync_working_sets` avant la boucle — l'ordre compte : le sync change l'ensemble des projets),
+`--fix-gwt` (forçage explicite), `--report` (timings par appel,
+faits des projets en erreur et des fournisseurs cités, une ligne par type non résolu, candidats
+écartés de chaque décision), `--report-all-facts`, `--report-out <chemin>`, `--summary`, `--json`.
+
+Le doctor imprime des lignes de traçabilité sur **stdout** — `[doctor:run]`, `[doctor:decision]`,
+`[doctor:decision-blocked]` (une décision écartée par la mémoire des `no-effect` ou par la garde
+`clean`), `[doctor:outcome]`, `[doctor:pass]`, `[doctor:deleted]`, `[doctor:delete-refused]`,
+`[doctor:batch-error]` (les `errors[]` du batch), `[doctor:removed]` / `[doctor:remove-refused]`
+(`remove_projects`), `[doctor:collateral]` (marqueurs en hand-off sur un projet déjà ciblé par un
+remède de la même passe, vs pas), `[doctor:handoff]`, `[doctor:handoff-reattached]` (un marqueur
+hand-off dont le nom est déjà couvert par une décision racine du même projet), `[doctor:handoff-total]`
+(uniquement sur le plan **final** — plus d'annonce provisoire à chaque passe), `[doctor:unresolved]`,
+`[doctor:end]` — au format `clé=valeur`. La plus utile est `outcome` : pour chaque remède, les
+erreurs avant/après sur les projets visés et un verdict `resolved` / `partial` / `no-effect` /
+`progressed` / `regressed`. `progressed` distingue, à compte d'erreurs constant, un classement juste
+qu'il fallait rejouer (l'ensemble des noms non résolus a changé) d'un vrai `no-effect` (rien n'a
+changé) — seul ce dernier alimente la mémoire qui empêche de rejouer un remède déjà prouvé inefficace
+dans ce run. L'attribution est **exclusive** (le delta d'un projet compte dans une seule ligne),
+restreinte à la cohorte connue à l'entrée de passe (un projet révélé en cours de passe — bundle
+ouvert, projet importé — compte dans `revealed`, jamais en régression d'une cohorte dont il n'a
+jamais fait partie), et `[doctor:pass]`/`[doctor:end]` la rendent vérifiable : `attributed` doit
+valoir `errors_before - errors_after`, et `blind` isole le delta des remèdes appliqués sans
+classement (gratuits parce que le batch build de toute façon). `regressed` se déclenche aussi au
+niveau passe (cohorte en hausse), remonté dans `[doctor:end]`. Rien n'est écrit sur disque sauf si
+`--report-out <chemin>` est donné (markdown + `.jsonl`), à l'exception de `remove_projects` (résidu
+d'une coquille non suivie par git — voir plus haut).
+
+Wrappers unitaires, si besoin de granularité : `bm-eclipse-status` (instances Eclipse joignables +
+nb de tools, `--projects` pour lister les projets), `bm-eclipse-call` (invocateur générique),
+`bm-eclipse-sync` (`sync_projects` + `sync_working_sets` optionnel — `--working-sets-only` saute
+`sync_projects` pour ne faire que les working sets —, plus la gestion open/close :
+`--close`/`--open <noms>` par nom exact, `--close-group`/`--open-group {gwt,closure}` sur des
+groupements de projets rarement travaillés identifiés par chemin disque, et `--focus <noms>` qui
+ouvre l'ensemble donné et ferme tout le reste — la sélection de l'ensemble « nécessaire » pour une
+classe/un ticket/un sujet reste un raisonnement de l'appelant (`locate_type`, `get_bundle_state`),
+pas une heuristique du script), `bm-eclipse-projects`
+(**toujours avec `--name`** : sans filtre la sortie fait plusieurs Mo à cause de la colonne working
+sets) et `bm-eclipse-problems` (lecture seule), `bm-classpath-check` (sources générées manquantes,
+pur filesystem) et `bm-rebuild-module` (rebuild Maven ciblé + refresh ; déduit tous les profils
+Maven gatants en remontant les `pom.xml` du module jusqu'à la racine ; pas de `-am` par défaut, retry
+avec `-am` seulement si le réacteur échoue sans ; `--no-refresh` pour un appelant qui plie le refresh
+dans son propre batch Eclipse). Skills associées :
+`eclipse-sync` (synchronisation guidée) et `eclipse-doctor` (réparation du mécanique, puis hand-off
+sur les vraies erreurs de code).
