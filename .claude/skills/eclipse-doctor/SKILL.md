@@ -108,6 +108,14 @@ devient `to_close`/protégé. Le hand-off `protected-conflict` reste possible, m
 vrai conflit entre deux demandes explicites de l'appel, plus jamais comme sous-produit du close de
 masse.
 
+**Les features PDE requises par un seed ne font jamais partie du close set d'un `--focus`** —
+invisibles à la clôture Require-Bundle par construction (pas des bundles). `net.bluemind.tests.feature`
+(universelle, tout lancement de test MCP) et les `eclipse-feature` déclarées dans le `pom.xml` de
+chaque seed (propres au projet, ex. `net.bluemind.exchange.mapi.feature` pour mapi) sont toutes les
+deux protégées mécaniquement dans `plan_focus` — voir la skill `eclipse-sync` § « Bundle de travail »
+pour l'incident qui l'a motivée (01/09 : les deux fermées par le même focus, tout test lancé
+ensuite échouait sur une fausse panne `No connection factory found for dbtype PGSQL`).
+
 **Conflit entre deux demandes explicites du même run** : si le projet qui aurait besoin d'être
 fermé (dans le cas ci-dessus) est lui-même demandé **ouvert** ce même run (`--open`/`--focus`), ce
 n'est plus mécanique — c'est deux demandes explicites qui se contredisent. Aucun des deux côtés
@@ -339,6 +347,15 @@ projets de cette ligne ont été crédités à une autre — l'attribution est e
 `[doctor:*]` est sur **stdout** ; le heartbeat reste sur **stderr** au format `[doctor] <phase> … Ns`.
 
 ## Réflexe de diagnostic — un seul appel
+
+Pour « ce test échoue d'une façon qui ne ressemble pas au bug attendu » (erreur d'infra avant même
+d'atteindre le corps du test, timeout inhabituel, message sans rapport avec le code touché) : `bm-eclipse-call
+check_pom_sync '{}'` **avant** de conclure à une vraie régression. Lecture seule, quasi instantané
+(pas de build, pas d'appel Maven — juste le `global/pom.xml` parsé et les VM args du JRE par défaut
+lus en mémoire) : même comparaison que le menu **BlueMind → Check POM Sync...**.  `inSync: false`
+explique souvent un échec qui n'a rien à voir avec le code (un `docker.devenv.tag` périmé, un flag
+JVM ajouté depuis dans `tycho.testArgLine` et jamais resynchronisé) plutôt qu'une régression — cas
+réel du 01/09 sur `StartupTests` (mapi), où ça a permis d'écarter cette piste en un appel.
 
 Pour « où vit ce type ? » : `bm-eclipse-call locate_type '{"names":["AIActionDescriptor"]}'`. Ça
 donne `jdt-visible` / `disk-only` / `closed-provider` / `nowhere`, les projets côté JDT et côté

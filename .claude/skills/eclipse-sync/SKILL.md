@@ -83,16 +83,19 @@ le bon outil quand aucune réparation n'est voulue (juste changer la forme du wo
 1. **Par nom** — « ferme net.bluemind.foo » → `bm-eclipse-sync --close net.bluemind.foo` (dry-run),
    confirmation, puis `--apply`. Noms exacts, séparés par des virgules pour plusieurs à la fois.
 
-   **« ouvre X » nu (sans autre précision) sous-entend `--focus X` par défaut** : ouvrir X ferme
-   tout le reste des projets ouverts (sauf les dépendances transitives que X nécessite — le doctor
-   les rouvre de lui-même si besoin, voir le point 3 plus bas). Défaut **surchargeable par mémoire
-   utilisateur** (ex: un utilisateur qui a mémorisé « ouvre veut juste dire ouvrir, ne ferme jamais
-   le reste » applique `--open` simple à la place). Pierre a fixé ce défaut le 14/08 — un autre
-   utilisateur de cette skill peut le vouloir différent, donc ça vit en mémoire, pas câblé en dur
-   ici (même logique que les autres défauts personnels de cette page).
-   Ce qui bascule sur `--open` simple (pas de fermeture du reste) : une demande qui qualifie
-   explicitement l'ouverture comme un ajout — « ouvre X **en plus** », « ouvre X, garde le reste »,
-   « ajoute X aux projets ouverts ».
+   **« ouvre X » nu (sans autre précision) veut dire ouvrir X** — `bm-eclipse-sync --open X`, le
+   reste du workspace n'est pas touché. Ce qui bascule sur `--focus X` (point 3 plus bas — ouvre X
+   **et** ce qu'il requiert, ferme tout le reste) : une demande qui qualifie explicitement
+   l'ouverture comme un rétrécissement — « ouvre **juste** X », « **seulement** X », « focus sur
+   X », « je vais bosser sur X, ferme le reste ». Défaut **surchargeable par mémoire utilisateur**
+   dans l'autre sens (un utilisateur qui veut que « ouvre X » nu ferme systématiquement le reste
+   peut le mémoriser).
+   Pierre a inversé ce défaut le 01/09 après un incident réel : un focus déclenché implicitement
+   par un « ouvre X » nu avait fermé `net.bluemind.jdbc.pgsql.provider`, fourni par point
+   d'extension et donc invisible à la fermeture mécanique Require-Bundle (voir point 3) ; un test
+   lancé ensuite a échoué avec `No connection factory found for dbtype PGSQL`, se faisant passer
+   pour une vraie régression alors que c'était un effet de bord de la fermeture. `--open` simple
+   n'a pas ce risque : il n'écarte jamais un projet déjà ouvert.
 2. **Par groupement** — « ferme les gwt », « ferme les closure » → `bm-eclipse-sync --close-group
    gwt` / `--close-group closure` (dry-run, liste tout ce qui serait fermé), confirmation, `--apply`.
    Les deux groupes sont identifiés par **chemin disque**, pas par un motif de nom :
@@ -128,6 +131,25 @@ le bon outil quand aucune réparation n'est voulue (juste changer la forme du wo
    seulement pour un vrai conflit entre deux volontés explicites de l'appel (garder X fermé ET
    garder X ouvert), plus jamais comme sous-produit du close de masse (voir `eclipse-doctor` §
    fermeture protégée).
+
+   **Les features PDE requises par un seed ne se ferment jamais par un focus**, même si rien ne
+   les référence en Require-Bundle : une feature n'est pas un bundle, donc la clôture mécanique ne
+   peut structurellement jamais la voir. Deux sources, protégées séparément dans `plan_focus`
+   (`_eclipse_workspace.py`) :
+   - **`net.bluemind.tests.feature`** — universelle, ajoutée d'office à tout lancement de test MCP
+     (`BmTestLaunchShortcut.buildSelectedFeatures`, `net.bluemind.devtools`), protection statique
+     (`TEST_LAUNCH_ALWAYS_OPEN`) ;
+   - **les `<requirement><type>eclipse-feature</type></requirement>` du `pom.xml`** de chaque seed
+     — propres au projet (ex. `net.bluemind.exchange.mapi.feature` pour les `*.tests` mapi),
+     lues dynamiquement (`pom_feature_requirements`, même parsing que
+     `BmTestLaunchShortcut.readExtraFeatureRequirements`).
+
+   Incident du 01/09 : un focus sur 5 projets de test mapi avait fermé les deux à la fois
+   (`net.bluemind.tests.feature` et `net.bluemind.exchange.mapi.feature`) ; tout test lancé
+   ensuite échouait sur `No connection factory found for dbtype PGSQL` (le launch retombe sur une
+   copie target platform de la feature au lieu du workspace) — pas un vrai échec, un effet de bord
+   invisible tant qu'on ne sait pas que ces features existent. Protection mécanique désormais dans
+   le script, pas un rappel à faire manuellement.
 
 `open_projects`/`close_projects` ne demandent **aucun** consentement côté plugin (contrairement à
 `sync_projects`/`sync_working_sets`) : état IDE local, rien sur disque, réversible en un appel. La

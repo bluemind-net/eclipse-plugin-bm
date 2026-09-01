@@ -71,6 +71,7 @@ import org.osgi.framework.ServiceReference;
 
 import net.bluemind.devtools.Activator;
 import net.bluemind.devtools.testrunner.PomPropertyReader;
+import net.bluemind.devtools.testrunner.PomSyncChecker;
 
 public final class BmMcpTools {
 
@@ -95,6 +96,7 @@ public final class BmMcpTools {
 	public static final String TOOL_DOCTOR_SNAPSHOT = "doctor_snapshot";
 	public static final String TOOL_DOCTOR_STATUS = "doctor_status";
 	public static final String TOOL_LOCATE_TYPE = "locate_type";
+	public static final String TOOL_CHECK_POM_SYNC = "check_pom_sync";
 
 	/**
 	 * Id of the working set PAGE JDT registers on {@code org.eclipse.ui.workingSets} —
@@ -423,7 +425,18 @@ public final class BmMcpTools {
 						Map.of(
 								"phase", paramString("'start' to show the entry, 'end' to close it."),
 								"detail", paramString("Optional detail appended to the job label.")),
-						List.of("phase")));
+						List.of("phase")),
+				toolDescriptor(TOOL_CHECK_POM_SYNC,
+						"Same comparison as the BlueMind > Check POM Sync... menu action, read-only (never"
+								+ " applies anything). Compares the workspace's default JRE VM arguments and target"
+								+ " platform location against the BlueMind global pom.xml (tycho.testArgLine,"
+								+ " resolving ${docker.devenv.tag}, and target-platform-version) and reports whether"
+								+ " each is in sync, plus the resolved values on both sides — a launch that silently"
+								+ " runs with stale VM args (an old docker.devenv.tag, a missing flag added since)"
+								+ " looks like a real test failure otherwise. Needs a BlueMind workspace (a project"
+								+ " whose ancestry contains global/pom.xml); returns notABlueMindWorkspace=true"
+								+ " otherwise.",
+						Map.of(), List.of()));
 	}
 
 	public static CompletableFuture<TestRunResult> invoke(String tool, Map<String, Object> args, long timeoutMs)
@@ -669,7 +682,8 @@ public final class BmMcpTools {
 				|| TOOL_LIST_PROJECTS.equals(name) || TOOL_WORKSPACE_INFO.equals(name)
 				|| TOOL_SYNC_WORKING_SETS.equals(name) || TOOL_APPLY_BATCH.equals(name)
 				|| TOOL_BUNDLE_STATE.equals(name) || TOOL_DOCTOR_SNAPSHOT.equals(name)
-				|| TOOL_DOCTOR_STATUS.equals(name) || TOOL_LOCATE_TYPE.equals(name);
+				|| TOOL_DOCTOR_STATUS.equals(name) || TOOL_LOCATE_TYPE.equals(name)
+				|| TOOL_CHECK_POM_SYNC.equals(name);
 	}
 
 	public static ToolResult invokeText(String tool, Map<String, Object> args) {
@@ -715,6 +729,8 @@ public final class BmMcpTools {
 					asStringList(args.get("bundles")));
 		case TOOL_DOCTOR_STATUS:
 			return doctorStatus(str(args, "phase"), str(args, "detail"));
+		case TOOL_CHECK_POM_SYNC:
+			return checkPomSync();
 		default:
 			throw new IllegalArgumentException("Unknown tool: " + tool);
 		}
@@ -2127,6 +2143,54 @@ public final class BmMcpTools {
 		json.put("openProjects", openCount);
 		json.put("closedProjects", closedCount);
 		return json;
+	}
+
+	// Read-only mirror of PomSyncChecker.computeStatus() — same comparison the BlueMind >
+	// Check POM Sync... menu action runs, exposed over MCP so a script can tell "stale JVM
+	// args" apart from a real test failure without a manual click.
+	public static ToolResult checkPomSync() {
+		var status = PomSyncChecker.computeStatus();
+		if (status == null) {
+			Map<String, Object> json = new LinkedHashMap<>();
+			json.put("notABlueMindWorkspace", true);
+			StringBuilder sb = new StringBuilder();
+			sb.append("# POM sync — not a BlueMind workspace\n\n");
+			sb.append("No global/pom.xml found in any open project's ancestry.\n");
+			appendJsonBlock(sb, json);
+			return new ToolResult(true, sb.toString());
+		}
+
+		Map<String, Object> json = new LinkedHashMap<>();
+		json.put("inSync", !status.hasMismatch());
+		json.put("vmArgsMismatch", status.vmArgsMismatch());
+		json.put("targetPlatformMismatch", status.targetPlatformMismatch());
+		json.put("workspaceVmArgs", status.workspaceConfig().vmArgs());
+		json.put("workspaceVmName", status.workspaceConfig().vmName());
+		json.put("pomResolvedTestArgLine", status.pomProps().resolvedTestArgLine());
+		json.put("pomDockerDevenvTag", status.pomProps().dockerDevenvTag());
+		json.put("pomTargetPlatformVersion", status.pomProps().targetPlatformVersion());
+		json.put("pomTargetRepoUrl", status.pomProps().targetRepoUrl());
+		json.put("workspaceHasTarget", status.workspaceConfig().hasTarget());
+		var bmLocation = status.workspaceConfig().bmLocation();
+		json.put("workspaceTargetLocation", bmLocation == null ? null : bmLocation.location());
+		json.put("localJvmOptionsFile", status.hasLocalJvmOptions() ? status.localJvmOptions() : null);
+
+		StringBuilder sb = new StringBuilder();
+		sb.append("# POM sync — ").append(status.hasMismatch() ? "MISMATCH" : "in sync").append("\n\n");
+		if (status.vmArgsMismatch()) {
+			sb.append("VM args: workspace default JRE (").append(status.workspaceConfig().vmName())
+					.append(") does not match tycho.testArgLine from the pom (docker.devenv.tag=")
+					.append(status.pomProps().dockerDevenvTag()).append(").\n");
+		}
+		if (status.targetPlatformMismatch()) {
+			sb.append("Target platform: workspace location does not match the pom's target-platform-version (")
+					.append(status.pomProps().targetPlatformVersion()).append(").\n");
+		}
+		if (!status.hasMismatch()) {
+			sb.append("Workspace settings match the global pom.\n");
+		}
+		appendJsonBlock(sb, json);
+		return new ToolResult(true, sb.toString());
 	}
 
 	/**
