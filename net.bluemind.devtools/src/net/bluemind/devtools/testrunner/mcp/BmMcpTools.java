@@ -442,17 +442,26 @@ public final class BmMcpTools {
 				toolDescriptor(TOOL_TEST_RUN_STATUS,
 						"Point-in-time status of the currently active MCP-triggered test run (run_bundle_tests/"
 								+ " run_class_tests/run_test_method), or 'active: false' if none. Read-only, never"
-								+ " blocks. Reports: target, elapsed time, time since the last observed activity"
-								+ " (a stream write or a test start/finish event — the way to tell 'still running,"
-								+ " just quiet' from 'genuinely stuck' without guessing), live pass/fail/error"
+								+ " blocks. Reports: target, elapsed time, 'sinceLastTestEventMs' (time since the"
+								+ " last real JUnit test start/finish — THE signal to judge whether the run is"
+								+ " actually stuck: it only advances on genuine test progress, unlike"
+								+ " 'sinceLastActivityMs' below which any console line also resets and can look"
+								+ " fresh even when no test has progressed in minutes), live pass/fail/error"
 								+ " counts, the currently running test if known, 'allFailingSoFar' (3+ tests seen"
 								+ " and every one failed/errored — smells like a broken setup rather than N"
-								+ " unrelated bugs), 'troubleSignals' (counts of known trouble strings seen so far"
-								+ " in the console output — e.g. Vert.x 'has been blocked for'/BlockedThreadChecker"
-								+ " spam, OutOfMemoryError, connection refused), and the last ~4000 characters of"
-								+ " stdout/stderr so a caller does not have to read the log files separately. Use"
-								+ " this instead of blind-waiting on a long run, and to decide whether to call"
-								+ " cancel_test_run — this tool never cancels anything by itself.",
+								+ " unrelated bugs), 'waitingOn' (container images currently being created by"
+								+ " Testcontainers, with elapsed ms — best-effort, log-pattern based, not a real"
+								+ " Docker query: a container spawn that's slow shows up here instead of looking"
+								+ " like silence), 'troubleSignals' (counts of known trouble strings seen so far in"
+								+ " the console output — e.g. Vert.x 'has been blocked for'/BlockedThreadChecker"
+								+ " spam, OutOfMemoryError, connection refused — INFORMATIONAL ONLY: this can climb"
+								+ " steadily on a run that is still progressing fine, e.g. Vert.x blocked-thread"
+								+ " spam from an unrelated missing local service; never key a 'this is dead'"
+								+ " decision off troubleSignals alone, use sinceLastTestEventMs for that), and the"
+								+ " last ~4000 characters of stdout/stderr so a caller does not have to read the"
+								+ " log files separately. Use this instead of blind-waiting on a long run, and to"
+								+ " decide whether to call cancel_test_run — this tool never cancels anything by"
+								+ " itself.",
 						Map.of(), List.of()),
 				toolDescriptor(TOOL_CANCEL_TEST_RUN,
 						"Forcibly terminate the currently active MCP-triggered test run and release the MCP"
@@ -874,6 +883,7 @@ public final class BmMcpTools {
 		if (active) {
 			sb.append("Target: ").append(status.get("target")).append("\n");
 			sb.append("Elapsed: ").append(formatMs((Long) status.get("elapsedMs")))
+					.append(" | Since last test event: ").append(formatMs((Long) status.get("sinceLastTestEventMs")))
 					.append(" | Since last activity: ").append(formatMs((Long) status.get("sinceLastActivityMs")))
 					.append("\n");
 			Object cur = status.get("currentTest");
@@ -888,9 +898,17 @@ public final class BmMcpTools {
 						+ " individual test bugs.**\n");
 			}
 			@SuppressWarnings("unchecked")
+			Map<String, Long> waitingOn = (Map<String, Long>) status.get("waitingOn");
+			if (waitingOn != null && !waitingOn.isEmpty()) {
+				sb.append("\n**Waiting on containers (Testcontainers):**\n");
+				waitingOn.forEach((image, sinceMs) -> sb.append("- ").append(image).append(": creating for ")
+						.append(formatMs(sinceMs)).append("\n"));
+			}
+			@SuppressWarnings("unchecked")
 			Map<String, Integer> signals = (Map<String, Integer>) status.get("troubleSignals");
 			if (signals != null && !signals.isEmpty()) {
-				sb.append("\n**Trouble signals seen in the console:**\n");
+				sb.append("\n**Trouble signals seen in the console (informational — not a liveness signal,"
+						+ " use \"since last test event\" above for that):**\n");
 				signals.forEach(
 						(k, v) -> sb.append("- \"").append(k).append("\": ").append(v).append(" occurrence(s)\n"));
 			}

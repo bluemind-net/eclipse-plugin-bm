@@ -192,16 +192,25 @@ posé jusqu'au timeout interne de 30 min. Avant ça — ou pour diagnostiquer un
 lent — deux outils dédiés :
 
 - **`get_test_run_status`** — aucun argument, jamais bloquant. Renvoie, si un run est actif :
-  `target`, `elapsedMs`, `sinceLastActivityMs` (temps depuis la dernière activité observée — une
-  écriture stdout/stderr ou un événement de début/fin de test ; c'est ce qui distingue « tourne
-  encore, juste silencieux » de « vraiment planté », sans avoir à deviner), `currentTest`, les
-  compteurs live `total`/`passed`/`failed`/`errored`/`ignored`, `allFailingSoFar` (3+ tests vus et
-  tous en échec/erreur — sent le setup cassé plutôt que N bugs indépendants), `troubleSignals`
-  (occurrences de signatures connues repérées dans la console au fil de l'eau — `has been blocked
-  for`, `BlockedThreadChecker`, `OutOfMemoryError`, `Address already in use`, `Connection refused`,
-  `Deadlock` — le genre de spam Vert.x `BlockedThreadChecker` qui remplit la console sans qu'aucun
-  test n'avance), et les ~4000 derniers caractères de stdout/stderr (`stdoutTail`/`stderrTail`) —
-  pas besoin d'aller lire les fichiers de log séparément pour un premier coup d'œil.
+  `target`, `elapsedMs`, `sinceLastTestEventMs` (temps depuis le dernier événement JUnit réel —
+  début/fin de test — **le signal à utiliser pour juger si un run est vraiment planté**, il n'avance
+  que sur une vraie progression), `sinceLastActivityMs` (temps depuis la dernière activité console,
+  au sens large — n'importe quelle ligne stdout/stderr la remet à zéro, y compris du bruit qui ne
+  reflète aucune progression réelle ; utile pour savoir si le process est encore vivant, pas pour
+  juger s'il avance), `currentTest`, les compteurs live `total`/`passed`/`failed`/`errored`/`ignored`,
+  `allFailingSoFar` (3+ tests vus et tous en échec/erreur — sent le setup cassé plutôt que N bugs
+  indépendants), `waitingOn` (images de conteneurs Testcontainers actuellement en cours de création,
+  avec le temps écoulé — détecté par pattern sur les logs `tc.<image>` — « Creating container for
+  image: X » / « Container X started in ... » —, pas une vraie requête Docker : donne une explication
+  à un run qui semble lent le temps qu'un conteneur (ex. `elasticsearch-tests`) démarre, plutôt que de
+  laisser deviner), `troubleSignals` (occurrences de signatures connues repérées dans la console au
+  fil de l'eau — `has been blocked for`, `BlockedThreadChecker`, `OutOfMemoryError`, `Address already
+  in use`, `Connection refused`, `Deadlock` — **informatif seulement, pas un signal d'arrêt** : un
+  run peut accumuler du spam `BlockedThreadChecker` en continu — typiquement un service local absent,
+  ex. KeyDB — tout en progressant normalement ; se fier à `troubleSignals` seul pour décider qu'un run
+  est mort produit des faux positifs, utiliser `sinceLastTestEventMs` pour ce jugement), et les ~4000
+  derniers caractères de stdout/stderr (`stdoutTail`/`stderrTail`) — pas besoin d'aller lire les
+  fichiers de log séparément pour un premier coup d'œil.
 - **`cancel_test_run`** — aucun argument. Termine chaque process OS attaché au run, puis le launch
   Eclipse sous-jacent en filet de sécurité (utile si le hang survient avant qu'aucun process ne
   soit même attaché), puis libère le verrou immédiatement — sans attendre le timeout de 30 min.
