@@ -97,6 +97,8 @@ public final class BmMcpTools {
 	public static final String TOOL_DOCTOR_STATUS = "doctor_status";
 	public static final String TOOL_LOCATE_TYPE = "locate_type";
 	public static final String TOOL_CHECK_POM_SYNC = "check_pom_sync";
+	public static final String TOOL_TEST_RUN_STATUS = "get_test_run_status";
+	public static final String TOOL_CANCEL_TEST_RUN = "cancel_test_run";
 
 	/**
 	 * Id of the working set PAGE JDT registers on {@code org.eclipse.ui.workingSets} —
@@ -436,6 +438,30 @@ public final class BmMcpTools {
 								+ " looks like a real test failure otherwise. Needs a BlueMind workspace (a project"
 								+ " whose ancestry contains global/pom.xml); returns notABlueMindWorkspace=true"
 								+ " otherwise.",
+						Map.of(), List.of()),
+				toolDescriptor(TOOL_TEST_RUN_STATUS,
+						"Point-in-time status of the currently active MCP-triggered test run (run_bundle_tests/"
+								+ " run_class_tests/run_test_method), or 'active: false' if none. Read-only, never"
+								+ " blocks. Reports: target, elapsed time, time since the last observed activity"
+								+ " (a stream write or a test start/finish event — the way to tell 'still running,"
+								+ " just quiet' from 'genuinely stuck' without guessing), live pass/fail/error"
+								+ " counts, the currently running test if known, 'allFailingSoFar' (3+ tests seen"
+								+ " and every one failed/errored — smells like a broken setup rather than N"
+								+ " unrelated bugs), 'troubleSignals' (counts of known trouble strings seen so far"
+								+ " in the console output — e.g. Vert.x 'has been blocked for'/BlockedThreadChecker"
+								+ " spam, OutOfMemoryError, connection refused), and the last ~4000 characters of"
+								+ " stdout/stderr so a caller does not have to read the log files separately. Use"
+								+ " this instead of blind-waiting on a long run, and to decide whether to call"
+								+ " cancel_test_run — this tool never cancels anything by itself.",
+						Map.of(), List.of()),
+				toolDescriptor(TOOL_CANCEL_TEST_RUN,
+						"Forcibly terminate the currently active MCP-triggered test run and release the MCP"
+								+ " test-run lock (tool calls are otherwise serialized: a stuck run blocks every"
+								+ " subsequent run_bundle_tests/run_class_tests/run_test_method call until this is"
+								+ " called or Eclipse is restarted). Terminates every OS process attached to the"
+								+ " run, then the underlying Eclipse launch as a fallback for a hang that never got"
+								+ " that far. No-op (cancelled: false) if nothing is active. Use get_test_run_status"
+								+ " first to check whether the run actually looks stuck before cancelling.",
 						Map.of(), List.of()));
 	}
 
@@ -683,7 +709,8 @@ public final class BmMcpTools {
 				|| TOOL_SYNC_WORKING_SETS.equals(name) || TOOL_APPLY_BATCH.equals(name)
 				|| TOOL_BUNDLE_STATE.equals(name) || TOOL_DOCTOR_SNAPSHOT.equals(name)
 				|| TOOL_DOCTOR_STATUS.equals(name) || TOOL_LOCATE_TYPE.equals(name)
-				|| TOOL_CHECK_POM_SYNC.equals(name);
+				|| TOOL_CHECK_POM_SYNC.equals(name) || TOOL_TEST_RUN_STATUS.equals(name)
+				|| TOOL_CANCEL_TEST_RUN.equals(name);
 	}
 
 	public static ToolResult invokeText(String tool, Map<String, Object> args) {
@@ -731,6 +758,10 @@ public final class BmMcpTools {
 			return doctorStatus(str(args, "phase"), str(args, "detail"));
 		case TOOL_CHECK_POM_SYNC:
 			return checkPomSync();
+		case TOOL_TEST_RUN_STATUS:
+			return testRunStatus();
+		case TOOL_CANCEL_TEST_RUN:
+			return cancelTestRun();
 		default:
 			throw new IllegalArgumentException("Unknown tool: " + tool);
 		}
@@ -833,6 +864,70 @@ public final class BmMcpTools {
 		appendJsonBlock(sb, Map.of("building", building, "settled", active.isEmpty(), "running", running,
 				"waiting", waiting, "activeFamilies", active, "jobs", jobs));
 		return new ToolResult(true, sb.toString());
+	}
+
+	public static ToolResult testRunStatus() {
+		Map<String, Object> status = BmMcpLauncher.instance().statusSnapshot();
+		boolean active = Boolean.TRUE.equals(status.get("active"));
+		StringBuilder sb = new StringBuilder();
+		sb.append("# Test run status — ").append(active ? "ACTIVE" : "idle").append("\n\n");
+		if (active) {
+			sb.append("Target: ").append(status.get("target")).append("\n");
+			sb.append("Elapsed: ").append(formatMs((Long) status.get("elapsedMs")))
+					.append(" | Since last activity: ").append(formatMs((Long) status.get("sinceLastActivityMs")))
+					.append("\n");
+			Object cur = status.get("currentTest");
+			if (cur != null) {
+				sb.append("Current test: ").append(cur).append("\n");
+			}
+			sb.append("Total: ").append(status.get("total")).append(" | Passed: ").append(status.get("passed"))
+					.append(" | Failed: ").append(status.get("failed")).append(" | Errored: ")
+					.append(status.get("errored")).append(" | Ignored: ").append(status.get("ignored")).append("\n");
+			if (Boolean.TRUE.equals(status.get("allFailingSoFar"))) {
+				sb.append("\n**Every test seen so far failed or errored — looks like a broken setup, not"
+						+ " individual test bugs.**\n");
+			}
+			@SuppressWarnings("unchecked")
+			Map<String, Integer> signals = (Map<String, Integer>) status.get("troubleSignals");
+			if (signals != null && !signals.isEmpty()) {
+				sb.append("\n**Trouble signals seen in the console:**\n");
+				signals.forEach(
+						(k, v) -> sb.append("- \"").append(k).append("\": ").append(v).append(" occurrence(s)\n"));
+			}
+			sb.append("\nRun dir: `").append(status.get("runDir")).append("`\n");
+			sb.append("\nIf this looks stuck, call cancel_test_run to terminate it and free the lock.\n");
+		} else {
+			sb.append("No MCP-triggered test run is currently active.\n");
+		}
+		appendJsonBlock(sb, status);
+		return new ToolResult(true, sb.toString());
+	}
+
+	public static ToolResult cancelTestRun() {
+		Map<String, Object> result = BmMcpLauncher.instance().cancel();
+		boolean cancelled = Boolean.TRUE.equals(result.get("cancelled"));
+		StringBuilder sb = new StringBuilder();
+		sb.append("# Cancel test run — ").append(cancelled ? "cancelled" : "nothing to cancel").append("\n\n");
+		if (cancelled) {
+			sb.append("Target: ").append(result.get("target")).append("\n");
+			@SuppressWarnings("unchecked")
+			List<String> terminated = (List<String>) result.get("terminatedProcesses");
+			sb.append("Terminated processes: ")
+					.append(terminated == null || terminated.isEmpty() ? "none (launch-level terminate only)"
+							: String.join(", ", terminated))
+					.append("\n");
+			@SuppressWarnings("unchecked")
+			List<String> errors = (List<String>) result.get("errors");
+			appendList(sb, "Errors", errors == null ? List.of() : errors);
+		} else {
+			sb.append(String.valueOf(result.get("reason"))).append("\n");
+		}
+		appendJsonBlock(sb, result);
+		return new ToolResult(true, sb.toString());
+	}
+
+	private static String formatMs(long ms) {
+		return ms < 1000 ? ms + "ms" : String.format("%.1fs", ms / 1000.0);
 	}
 
 	private static Map<String, Object> markerJson(IProject p, IMarker m, int severity) {

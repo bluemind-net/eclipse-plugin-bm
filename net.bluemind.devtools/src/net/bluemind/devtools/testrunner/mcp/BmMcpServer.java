@@ -214,7 +214,8 @@ public final class BmMcpServer {
 				BmMcpTools.TOOL_GET_BUILD_STATUS,
 				BmMcpTools.TOOL_CLEAN, BmMcpTools.TOOL_RELOAD_TARGET, BmMcpTools.TOOL_IMPORT_PROJECTS,
 				BmMcpTools.TOOL_OPEN_PROJECTS, BmMcpTools.TOOL_SYNC_PROJECTS, BmMcpTools.TOOL_LIST_PROJECTS,
-				BmMcpTools.TOOL_WORKSPACE_INFO, BmMcpTools.TOOL_SYNC_WORKING_SETS));
+				BmMcpTools.TOOL_WORKSPACE_INFO, BmMcpTools.TOOL_SYNC_WORKING_SETS,
+				BmMcpTools.TOOL_TEST_RUN_STATUS, BmMcpTools.TOOL_CANCEL_TEST_RUN));
 		names.addAll(net.bluemind.devtools.icr.IcrMcpTools.toolNames());
 		result.put("instructions",
 				"Controls the running Eclipse instance for BlueMind development. Tools: "

@@ -1,6 +1,8 @@
 package net.bluemind.devtools.testrunner;
 
+import java.util.ArrayList;
 import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Set;
 import java.util.jar.Manifest;
 
@@ -9,12 +11,17 @@ import javax.xml.parsers.DocumentBuilderFactory;
 import org.eclipse.core.resources.IProject;
 import org.eclipse.core.runtime.CoreException;
 import org.eclipse.core.runtime.ILog;
+import org.eclipse.core.runtime.NullProgressMonitor;
 import org.eclipse.core.runtime.Platform;
 import org.eclipse.debug.core.ILaunchConfigurationWorkingCopy;
 import org.eclipse.jdt.core.Flags;
+import org.eclipse.jdt.core.IAnnotation;
 import org.eclipse.jdt.core.IJavaElement;
+import org.eclipse.jdt.core.IMethod;
 import org.eclipse.jdt.core.IType;
+import org.eclipse.jdt.core.ITypeHierarchy;
 import org.eclipse.jdt.core.JavaModelException;
+import org.eclipse.jdt.core.Signature;
 import org.eclipse.jface.viewers.StructuredSelection;
 import org.eclipse.pde.ui.launcher.JUnitWorkbenchLaunchShortcut;
 import org.w3c.dom.Element;
@@ -63,11 +70,20 @@ public class BmTestLaunchShortcut extends JUnitWorkbenchLaunchShortcut {
 	public static void launchElement(IType type, String methodName, String mode, String mcpRequestId) {
 		try {
 			if (Flags.isAbstract(type.getFlags())) {
-				LOG.warn("Cannot run tests on abstract class: " + type.getFullyQualifiedName());
-				return;
+				throw new IllegalStateException("Cannot run tests on abstract class: " + type.getFullyQualifiedName());
 			}
-		} catch (Exception ignored) {
-			return;
+		} catch (JavaModelException e) {
+			// Cannot even read the flags: proceed and let JUnit itself report the
+			// problem rather than silently returning — a silent return here leaves the
+			// MCP run lock stuck forever (see the "no tests" check below for why).
+			LOG.warn("Could not read flags for " + type.getElementName() + ": " + e.getMessage());
+		}
+		if (!hasRunnableTests(type)) {
+			throw new IllegalStateException("No test methods found in " + type.getFullyQualifiedName()
+					+ " (checked its declared methods and its superclass chain for @Test/@TestFactory/"
+					+ "@TestTemplate/@ParameterizedTest/@RepeatedTest, and JUnit3 testXxx() if it extends"
+					+ " TestCase). Launching it anyway would hang: JUnit never starts a session when there is"
+					+ " nothing to run, so the MCP test-run lock would never see a completion event.");
 		}
 		IJavaElement element = methodName != null ? findTestMethod(type, methodName) : type;
 		PENDING_MCP_ID.set(mcpRequestId);
@@ -85,6 +101,63 @@ public class BmTestLaunchShortcut extends JUnitWorkbenchLaunchShortcut {
 		} finally {
 			PENDING_MCP_ID.remove();
 		}
+	}
+
+	private static final Set<String> TEST_ANNOTATIONS = Set.of("Test", "TestFactory", "TestTemplate",
+			"ParameterizedTest", "RepeatedTest");
+
+	/**
+	 * Best-effort: only ever answers {@code false} once the whole superclass chain has
+	 * resolved and genuinely carries no test-shaped method. Any resolution failure
+	 * (unresolved supertype, classpath issue) is treated as "cannot tell" and allows the
+	 * launch — this exists to catch a plain utility class with zero {@code @Test} methods
+	 * anywhere in its ancestry (the case that hangs the MCP lock), not to second-guess
+	 * JUnit itself on borderline cases.
+	 */
+	private static boolean hasRunnableTests(IType type) {
+		try {
+			List<IType> chain = new ArrayList<>();
+			chain.add(type);
+			ITypeHierarchy hierarchy = type.newSupertypeHierarchy(new NullProgressMonitor());
+			for (IType supertype : hierarchy.getAllSuperclasses(type)) {
+				if (!"java.lang.Object".equals(supertype.getFullyQualifiedName())) {
+					chain.add(supertype);
+				}
+			}
+			boolean junit3 = chain.stream()
+					.anyMatch(t -> "junit.framework.TestCase".equals(t.getFullyQualifiedName()));
+			for (IType t : chain) {
+				for (IMethod m : t.getMethods()) {
+					if (isAnnotatedTestMethod(m) || (junit3 && isJUnit3TestMethod(m))) {
+						return true;
+					}
+				}
+			}
+			return false;
+		} catch (JavaModelException e) {
+			LOG.warn("Could not resolve test methods for " + type.getFullyQualifiedName()
+					+ ", allowing the run: " + e.getMessage());
+			return true;
+		}
+	}
+
+	private static boolean isAnnotatedTestMethod(IMethod m) throws JavaModelException {
+		if (Flags.isAbstract(m.getFlags())) {
+			return false;
+		}
+		for (IAnnotation a : m.getAnnotations()) {
+			String name = a.getElementName();
+			String simple = name.contains(".") ? name.substring(name.lastIndexOf('.') + 1) : name;
+			if (TEST_ANNOTATIONS.contains(simple)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private static boolean isJUnit3TestMethod(IMethod m) throws JavaModelException {
+		return m.getElementName().startsWith("test") && Flags.isPublic(m.getFlags()) && !Flags.isStatic(m.getFlags())
+				&& m.getParameterTypes().length == 0 && Signature.SIG_VOID.equals(m.getReturnType());
 	}
 
 	private static IJavaElement findTestMethod(IType type, String methodName) {

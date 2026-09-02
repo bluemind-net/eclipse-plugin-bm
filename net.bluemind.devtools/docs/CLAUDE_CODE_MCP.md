@@ -169,6 +169,8 @@ est plus simple et supporte naturellement le multi-Eclipse.
 | `run_bundle_tests`| `project` (+ `mode?`)                            | Tous les tests d'un bundle `*.tests`                |
 | `run_class_tests` | `project`, `className` (FQN) (+ `mode?`)         | Tous les `@Test` d'une classe                       |
 | `run_test_method` | `project`, `className`, `methodName` (+ `mode?`) | Une seule méthode `@Test`                           |
+| `get_test_run_status` | —                                             | État du run de test MCP en cours (ou `active: false`). Lecture seule, ne bloque jamais. Voir détail ci-dessous |
+| `cancel_test_run` | —                                                 | Termine de force le run en cours et libère le verrou. Voir détail ci-dessous |
 
 Un `tools/call` bloque la réponse HTTP jusqu'à la fin de l'opération (timeout interne 30 min
 pour les runs de test ; un refresh typique se mesure en secondes).
@@ -177,6 +179,37 @@ pour les runs de test ; un refresh typique se mesure en secondes).
 `refresh_projects` avec la liste des bundles touchés avant le `run_*`. Ça garantit qu'Eclipse
 voit les changements disque et qu'un nouveau cycle de compil a eu lieu — sinon le launch peut
 tourner avec un `.class` obsolète.
+
+### Run de test bloqué : `get_test_run_status` / `cancel_test_run`
+
+`run_bundle_tests`/`run_class_tests`/`run_test_method` sont **sérialisés** : un seul run MCP actif
+à la fois, tout appel suivant échoue avec `Another MCP-triggered test run is already active` tant
+que le précédent n'est pas terminé. Un launch qui plante avant de créer une session JUnit (cible
+sans aucune méthode de test — un garde-fou côté launch bloque désormais ce cas précis, voir
+`net.bluemind.devtools.testrunner.BmTestLaunchShortcut#hasRunnableTests`) ou qui reste
+silencieusement bloqué (infra qui ne démarre jamais, deadlock applicatif) peut laisser ce verrou
+posé jusqu'au timeout interne de 30 min. Avant ça — ou pour diagnostiquer un run qui semble juste
+lent — deux outils dédiés :
+
+- **`get_test_run_status`** — aucun argument, jamais bloquant. Renvoie, si un run est actif :
+  `target`, `elapsedMs`, `sinceLastActivityMs` (temps depuis la dernière activité observée — une
+  écriture stdout/stderr ou un événement de début/fin de test ; c'est ce qui distingue « tourne
+  encore, juste silencieux » de « vraiment planté », sans avoir à deviner), `currentTest`, les
+  compteurs live `total`/`passed`/`failed`/`errored`/`ignored`, `allFailingSoFar` (3+ tests vus et
+  tous en échec/erreur — sent le setup cassé plutôt que N bugs indépendants), `troubleSignals`
+  (occurrences de signatures connues repérées dans la console au fil de l'eau — `has been blocked
+  for`, `BlockedThreadChecker`, `OutOfMemoryError`, `Address already in use`, `Connection refused`,
+  `Deadlock` — le genre de spam Vert.x `BlockedThreadChecker` qui remplit la console sans qu'aucun
+  test n'avance), et les ~4000 derniers caractères de stdout/stderr (`stdoutTail`/`stderrTail`) —
+  pas besoin d'aller lire les fichiers de log séparément pour un premier coup d'œil.
+- **`cancel_test_run`** — aucun argument. Termine chaque process OS attaché au run, puis le launch
+  Eclipse sous-jacent en filet de sécurité (utile si le hang survient avant qu'aucun process ne
+  soit même attaché), puis libère le verrou immédiatement — sans attendre le timeout de 30 min.
+  No-op (`cancelled: false`) si rien n'est actif.
+
+Aucun des deux ne prend de décision automatique : `get_test_run_status` ne fait qu'informer,
+`cancel_test_run` ne s'exécute que sur appel explicite. Le diagnostic (« ça a l'air planté ») reste
+un jugement humain ou de l'agent appelant, pas une heuristique qui tue un run tout seul.
 
 ## 4. Sécurité
 
