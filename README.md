@@ -144,3 +144,16 @@ mvn clean verify
 ```
 
 Le p2 repository est généré dans `net.bluemind.devtools.site/target/repository/`.
+
+### Itérer sur le plugin (recommandé)
+
+Pour tester ses propres modifications sans réinstaller à chaque fois depuis le site GitHub Pages :
+
+1. **Help → Install New Software...** → **Add...** → Location : le chemin local, en `file://`, vers
+   `net.bluemind.devtools.site/target/repository/` (ex :
+   `file:///home/<vous>/dev/eclipse-plugin-bm/net.bluemind.devtools.site/target/repository/`)
+2. Installer depuis ce site local (au lieu du site GitHub Pages)
+
+Ensuite, à chaque nouveau `mvn clean verify` : **Help → About Eclipse IDE → Installation Details**,
+sélectionner le plugin → **Update**. Comme le site pointe vers votre dossier local, Eclipse reprend
+directement la dernière version buildée — pas besoin de rajouter/retirer un site à chaque fois.

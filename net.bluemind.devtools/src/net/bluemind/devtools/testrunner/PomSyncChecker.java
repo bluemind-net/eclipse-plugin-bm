@@ -6,6 +6,7 @@ import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -209,7 +210,8 @@ public class PomSyncChecker {
 		}
 	}
 
-	private static void applySync(SyncStatus status) {
+	/** Package-visible so {@link WorkspaceSetup} can apply a mismatch unattended, without the dialog. */
+	static void applySync(SyncStatus status) {
 		if (status.vmArgsMismatch) {
 			applyVmArgsSync(status.pomProps.resolvedTestArgLine());
 		}
@@ -389,9 +391,29 @@ public class PomSyncChecker {
 		return false;
 	}
 
+	/**
+	 * A brand-new workspace's default target definition ("Running Platform") comes
+	 * with a {@code Profile} location pointing at the running Eclipse install
+	 * itself. Left in place, it silently shadows BlueMind's own dependency set
+	 * whenever the local Eclipse install happens to bundle a same-named,
+	 * higher-versioned singleton (seen with {@code slf4j.api}: Eclipse ships one
+	 * numerically newer than BlueMind's patched build, so OSGi's singleton
+	 * resolution — highest version wins, full stop — always picks the wrong one).
+	 * BlueMind's own IU/Directory location is meant to be self-sufficient, so this
+	 * location is never wanted alongside it.
+	 */
+	private static ITargetLocation[] stripProfileLocations(ITargetLocation[] locations) {
+		if (locations == null) {
+			return new ITargetLocation[0];
+		}
+		return Arrays.stream(locations).filter(loc -> !"Profile".equals(loc.getType()))
+				.toArray(ITargetLocation[]::new);
+	}
+
 	private static ITargetLocation[] replaceOrAddBmLocation(ITargetLocation[] existing,
 			ITargetLocation bmLocation, BmLocationInfo currentBmLocation) {
-		if (existing == null || existing.length == 0) {
+		existing = stripProfileLocations(existing);
+		if (existing.length == 0) {
 			return new ITargetLocation[] { bmLocation };
 		}
 		for (int i = 0; i < existing.length; i++) {
