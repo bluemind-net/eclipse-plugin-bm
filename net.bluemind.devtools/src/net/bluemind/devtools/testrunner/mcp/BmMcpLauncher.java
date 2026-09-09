@@ -7,19 +7,26 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
-import java.util.UUID;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import org.eclipse.core.runtime.CoreException;
 import org.eclipse.core.runtime.ILog;
 import org.eclipse.core.runtime.Platform;
+import org.eclipse.debug.core.DebugException;
 import org.eclipse.debug.core.DebugPlugin;
 import org.eclipse.debug.core.ILaunch;
 import org.eclipse.debug.core.ILaunchesListener2;
@@ -44,6 +51,27 @@ public final class BmMcpLauncher {
 	private static final BmMcpLauncher INSTANCE = new BmMcpLauncher();
 
 	/**
+	 * Cheap, best-effort signatures scanned in every stdout/stderr chunk as it streams
+	 * in. Not a parser — a chunk boundary can split one of these strings and miss it —
+	 * but good enough to turn "a run that's spamming warnings" into a countable signal
+	 * exposed by {@link #statusSnapshot()}, without touching the run itself.
+	 */
+	private static final List<String> TROUBLE_SIGNATURES = List.of("has been blocked for", "BlockedThreadChecker",
+			"OutOfMemoryError", "Address already in use", "Connection refused", "Deadlock");
+
+	/**
+	 * Testcontainers logs each container's lifecycle at INFO through a {@code tc.<image>}
+	 * logger — confirmed against a real run's console (elasticsearch-tests, 2026-09-02):
+	 * "Creating container for image: X" immediately followed, once the container is up
+	 * (observed 9-12s later for elasticsearch-tests), by "Container X started in ...".
+	 * Nothing is logged in between for a container with no INFO-level wait strategy, so the
+	 * gap between the two lines *is* the wait — same best-effort, chunk-boundary-sensitive
+	 * scanning as {@link #TROUBLE_SIGNATURES}, not a real Docker state query.
+	 */
+	private static final Pattern CONTAINER_CREATING = Pattern.compile("Creating container for image: (\\S+)");
+	private static final Pattern CONTAINER_STARTED = Pattern.compile("Container (\\S+) started in");
+
+	/**
 	 * Single-slot pending run. Callers serialize tool calls at the MCP server
 	 * layer, so at most one {@link Pending} is active at any time; this removes the
 	 * need to correlate {@link ITestRunSession} events back to a launch (the
@@ -62,11 +90,26 @@ public final class BmMcpLauncher {
 		}
 		TestRunListener testListener = new TestRunListener() {
 			@Override
+			public void testCaseStarted(ITestCaseElement el) {
+				Pending p = active;
+				if (p == null) {
+					return;
+				}
+				p.currentTest = testSlug(el);
+				long now = System.currentTimeMillis();
+				p.lastActivityAt.set(now);
+				p.lastTestEventAt.set(now);
+			}
+
+			@Override
 			public void testCaseFinished(ITestCaseElement el) {
 				Pending p = active;
 				if (p == null) {
 					return;
 				}
+				long now = System.currentTimeMillis();
+				p.lastActivityAt.set(now);
+				p.lastTestEventAt.set(now);
 				p.total.incrementAndGet();
 				Result r = el.getTestResult(false);
 				if (r == Result.OK) {
@@ -124,7 +167,7 @@ public final class BmMcpLauncher {
 		ensureStarted();
 		Pending p = beginRun(project.getElementName());
 		try {
-			BmTestLaunchShortcut.launchProject(project, mode, p.id);
+			BmTestLaunchShortcut.launchProject(project, mode);
 		} catch (RuntimeException e) {
 			failAndClear(p, e);
 		}
@@ -145,7 +188,7 @@ public final class BmMcpLauncher {
 		String slug = type.getElementName() + (methodName != null ? "#" + methodName : "");
 		Pending p = beginRun(slug);
 		try {
-			BmTestLaunchShortcut.launchElement(type, methodName, mode, p.id);
+			BmTestLaunchShortcut.launchElement(type, methodName, mode);
 		} catch (RuntimeException e) {
 			failAndClear(p, e);
 		}
@@ -160,7 +203,7 @@ public final class BmMcpLauncher {
 		Pending p;
 		try {
 			Path dir = BmMcpRunStore.allocate(slug);
-			p = new Pending(UUID.randomUUID().toString(), dir);
+			p = new Pending(slug, dir);
 		} catch (IOException e) {
 			throw new IllegalStateException("Could not allocate run directory: " + e.getMessage(), e);
 		}
@@ -187,21 +230,157 @@ public final class BmMcpLauncher {
 		});
 	}
 
-	private void attachStreams(ILaunch launch) {
-		if (launch == null || launch.getLaunchConfiguration() == null) {
-			return;
+	/**
+	 * Point-in-time snapshot of the active run, or {@code active: false}. Never blocks,
+	 * never touches the run itself — pure read, meant to be polled to tell a genuinely
+	 * stuck run apart from a slow-but-healthy one without guessing from silence.
+	 */
+	public Map<String, Object> statusSnapshot() {
+		Pending p = active;
+		Map<String, Object> m = new LinkedHashMap<>();
+		if (p == null) {
+			m.put("active", false);
+			return m;
 		}
-		String id;
+		long now = System.currentTimeMillis();
+		int total = p.total.get();
+		int failed = p.failed.get();
+		int errored = p.errored.get();
+		m.put("active", true);
+		m.put("target", p.slug);
+		m.put("startedAt", p.startedAt);
+		m.put("elapsedMs", now - p.startedAt);
+		m.put("lastActivityAt", p.lastActivityAt.get());
+		m.put("sinceLastActivityMs", now - p.lastActivityAt.get());
+		m.put("lastTestEventAt", p.lastTestEventAt.get());
+		m.put("sinceLastTestEventMs", now - p.lastTestEventAt.get());
+		m.put("currentTest", p.currentTest);
+		m.put("total", total);
+		m.put("passed", p.passed.get());
+		m.put("failed", failed);
+		m.put("errored", errored);
+		m.put("ignored", p.ignored.get());
+		// Cheap, non-authoritative hint: several tests in and every single one failing or
+		// erroring smells like a broken setup (infra never came up) rather than N unrelated
+		// test bugs — worth surfacing, not worth acting on by itself.
+		m.put("allFailingSoFar", total >= 3 && failed + errored == total);
+		Map<String, Integer> signals = new LinkedHashMap<>();
+		p.troubleSignals.forEach((k, v) -> signals.put(k, v.get()));
+		m.put("troubleSignals", signals);
+		Map<String, Long> waitingOn = new LinkedHashMap<>();
+		p.waitingOnContainers.forEach((image, since) -> waitingOn.put(image, now - since));
+		m.put("waitingOn", waitingOn);
+		m.put("runDir", p.runDir.toString());
+		m.put("stdoutTail", tail(p.stdoutFile, 4000));
+		m.put("stderrTail", tail(p.stderrFile, 4000));
+		return m;
+	}
+
+	/**
+	 * Forcibly ends the active run: terminates every {@link IProcess} attached to it, then
+	 * the underlying {@link ILaunch} as a fallback for a hang that never got that far (a
+	 * launch stuck before any process was even attached), then releases the MCP lock.
+	 * Idempotent no-op when nothing is active.
+	 */
+	public synchronized Map<String, Object> cancel() {
+		Pending p = active;
+		Map<String, Object> m = new LinkedHashMap<>();
+		if (p == null) {
+			m.put("cancelled", false);
+			m.put("reason", "No MCP test run is currently active.");
+			return m;
+		}
+		List<String> terminated = new ArrayList<>();
+		List<String> errors = new ArrayList<>();
+		for (IProcess proc : p.processes) {
+			try {
+				if (!proc.isTerminated()) {
+					proc.terminate();
+					terminated.add(proc.getLabel());
+				}
+			} catch (DebugException e) {
+				errors.add(proc.getLabel() + ": " + e.getMessage());
+			}
+		}
+		ILaunch launch = p.launch;
+		if (launch != null) {
+			try {
+				if (!launch.isTerminated()) {
+					launch.terminate();
+				}
+			} catch (DebugException e) {
+				errors.add("launch: " + e.getMessage());
+			}
+		}
+		failAndClear(p, new CancellationException("Cancelled via the cancel_test_run MCP tool."));
+		m.put("cancelled", true);
+		m.put("target", p.slug);
+		m.put("terminatedProcesses", terminated);
+		if (!errors.isEmpty()) {
+			m.put("errors", errors);
+		}
+		return m;
+	}
+
+	private static String tail(Path file, int maxChars) {
 		try {
-			id = launch.getLaunchConfiguration().getAttribute(BmTestLaunchShortcut.MCP_REQUEST_ID_ATTR, (String) null);
-		} catch (CoreException e) {
-			return;
+			if (file == null || !Files.exists(file)) {
+				return null;
+			}
+			String text = Files.readString(file, StandardCharsets.UTF_8);
+			return text.length() > maxChars ? text.substring(text.length() - maxChars) : text;
+		} catch (IOException e) {
+			return null;
 		}
-		if (id == null) {
+	}
+
+	private static String testSlug(ITestCaseElement el) {
+		String cls = el.getTestClassName();
+		String method = el.getTestMethodName();
+		return (cls == null ? "?" : cls) + "#" + (method == null ? "?" : method);
+	}
+
+	/**
+	 * Correlates an incoming {@link ILaunch} to the waiting {@link Pending} run, if any.
+	 *
+	 * <p>Used to key off an MCP-request-id attribute stamped on the launch configuration by
+	 * {@link BmTestLaunchShortcut#createLaunchConfiguration}. That broke silently: JDT/PDE
+	 * launch shortcuts reuse an existing launch configuration for a given target instead of
+	 * creating a new one, so {@code createLaunchConfiguration} — and the attribute stamp —
+	 * only ever ran on the *first* run of any given class/bundle in the workspace. Every
+	 * later run of the same target reused the old configuration carrying the first run's
+	 * stale id, which never matched the new {@link Pending}, so this method silently
+	 * returned early: no stream capture, and {@link #cancel()}'s {@code launch.terminate()}
+	 * fallback silently no-op'd too (confirmed against a real workspace, 2026-09-02).
+	 *
+	 * <p>Correlating by identity instead: MCP runs are strictly serialized ({@link #beginRun}
+	 * refuses a second one while one is active), so the first genuinely new {@link ILaunch}
+	 * to appear while a {@link Pending} is waiting for one ({@code p.launch == null}) — one
+	 * that did not already exist in {@link Pending#launchesBeforeStart}, the snapshot taken
+	 * right as the run began — can safely be assumed to be ours, no attribute read-back
+	 * needed. The one edge case this misattributes is a human manually starting an unrelated
+	 * launch in the same short window; acceptable since it only affects stream capture and
+	 * cancellation, never the JUnit result itself (that comes from the separate, global
+	 * {@link TestRunListener}).
+	 */
+	private void attachStreams(ILaunch launch) {
+		if (launch == null) {
 			return;
 		}
 		Pending p = active;
-		if (p == null || !p.id.equals(id)) {
+		if (p == null) {
+			return;
+		}
+		if (p.launch == null) {
+			// First sighting: the launch object usually appears (launchesAdded) before it has
+			// any IProcess yet, so this call's loop below often finds nothing — that's fine,
+			// the *next* launchesChanged call for this same, now-locked-on launch re-enters
+			// this method and the loop picks up the process once it actually exists.
+			if (p.launchesBeforeStart.contains(launch)) {
+				return;
+			}
+			p.launch = launch;
+		} else if (p.launch != launch) {
 			return;
 		}
 		for (IProcess proc : launch.getProcesses()) {
@@ -232,11 +411,39 @@ public final class BmMcpLauncher {
 	}
 
 	private void appendStdout(Pending p, String text) {
+		touchActivity(p, text);
 		writeStream(p.stdoutWriter, p.stdoutBytes, text);
 	}
 
 	private void appendStderr(Pending p, String text) {
+		touchActivity(p, text);
 		writeStream(p.stderrWriter, p.stderrBytes, text);
+	}
+
+	/**
+	 * Updates the staleness clock and the trouble-signature/container-wait state
+	 * {@link #statusSnapshot()} reports. Deliberately does not touch
+	 * {@link Pending#lastTestEventAt} — that clock reflects real JUnit lifecycle events
+	 * only, not console noise (see its javadoc).
+	 */
+	private void touchActivity(Pending p, String text) {
+		if (text == null || text.isEmpty()) {
+			return;
+		}
+		p.lastActivityAt.set(System.currentTimeMillis());
+		for (String sig : TROUBLE_SIGNATURES) {
+			if (text.contains(sig)) {
+				p.troubleSignals.computeIfAbsent(sig, k -> new AtomicInteger()).incrementAndGet();
+			}
+		}
+		Matcher creating = CONTAINER_CREATING.matcher(text);
+		while (creating.find()) {
+			p.waitingOnContainers.putIfAbsent(creating.group(1), System.currentTimeMillis());
+		}
+		Matcher started = CONTAINER_STARTED.matcher(text);
+		while (started.find()) {
+			p.waitingOnContainers.remove(started.group(1));
+		}
 	}
 
 	private void writeStream(BufferedWriter writer, AtomicLong counter, String text) {
@@ -246,6 +453,10 @@ public final class BmMcpLauncher {
 		synchronized (writer) {
 			try {
 				writer.write(text);
+				// Flushed on every chunk, not just on close: get_test_run_status reads this
+				// file live while the run is still active, so an unflushed buffer would make
+				// it lie about what the console actually shows right now.
+				writer.flush();
 				counter.addAndGet(text.getBytes(StandardCharsets.UTF_8).length);
 			} catch (IOException e) {
 				LOG.warn("Stream write failed: " + e.getMessage());
@@ -336,7 +547,7 @@ public final class BmMcpLauncher {
 	}
 
 	private static final class Pending {
-		final String id;
+		final String slug;
 		final Path runDir;
 		final Path stdoutFile;
 		final Path stderrFile;
@@ -345,6 +556,14 @@ public final class BmMcpLauncher {
 		final AtomicLong stdoutBytes = new AtomicLong();
 		final AtomicLong stderrBytes = new AtomicLong();
 		final long startedAt = System.currentTimeMillis();
+		final AtomicLong lastActivityAt = new AtomicLong(startedAt);
+		/**
+		 * Set only by {@code testCaseStarted}/{@code testCaseFinished} — real JUnit
+		 * progress, unlike {@link #lastActivityAt} which any console line (including
+		 * trouble-signature noise) also resets. The signal to trust when deciding whether
+		 * a run is genuinely stuck.
+		 */
+		final AtomicLong lastTestEventAt = new AtomicLong(startedAt);
 		final CompletableFuture<TestRunResult> future = new CompletableFuture<>();
 		final AtomicInteger total = new AtomicInteger();
 		final AtomicInteger passed = new AtomicInteger();
@@ -353,9 +572,21 @@ public final class BmMcpLauncher {
 		final AtomicInteger ignored = new AtomicInteger();
 		final List<TestRunResult.TestFailure> failures = Collections.synchronizedList(new ArrayList<>());
 		final Set<IProcess> processes = Collections.newSetFromMap(new ConcurrentHashMap<>());
+		final Map<String, AtomicInteger> troubleSignals = new ConcurrentHashMap<>();
+		/** Image -> creation-started-at, for images currently between "Creating container" and "started". */
+		final Map<String, Long> waitingOnContainers = new ConcurrentHashMap<>();
+		/**
+		 * Snapshot of every {@link ILaunch} that already existed the instant this run began.
+		 * {@link #attachStreams} treats the first launch NOT in this set as ours — see its
+		 * javadoc for why matching by launch-configuration attribute doesn't work.
+		 */
+		final Set<ILaunch> launchesBeforeStart = new HashSet<>(
+				Arrays.asList(DebugPlugin.getDefault().getLaunchManager().getLaunches()));
+		volatile String currentTest;
+		volatile ILaunch launch;
 
-		Pending(String id, Path runDir) {
-			this.id = id;
+		Pending(String slug, Path runDir) {
+			this.slug = slug;
 			this.runDir = runDir;
 			this.stdoutFile = runDir.resolve("stdout.log");
 			this.stderrFile = runDir.resolve("stderr.log");

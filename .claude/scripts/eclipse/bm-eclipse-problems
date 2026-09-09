@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+"""bm-eclipse-problems — wrapper around get_problems, grouped by project.
+
+Usage:
+  bm-eclipse-problems [--project NAME]... [--severity error|warning|all] [--json] [bundle-hint] [--config PATH]
+"""
+import argparse
+import json
+import os
+import re
+import sys
+from collections import defaultdict
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _eclipse_mcp as mcp
+
+MARKER_RE = re.compile(r"^\s*-\s*\[(ERROR|WARN|INFO)\]\s*(\S+?)(?::(\d+))?\s*—\s*(.*)$")
+
+
+def group_by_project(markdown):
+    groups = defaultdict(list)
+    for line in markdown.splitlines():
+        m = MARKER_RE.match(line)
+        if not m:
+            continue
+        severity, path, lineno, message = m.groups()
+        project = path.lstrip("/").split("/")[0]
+        groups[project].append(f"  [{severity}] {path}{':' + lineno if lineno else ''} — {message}")
+    return groups
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--project", action="append", dest="projects", default=[],
+                     help="Restrict to this project (repeatable). Default: all open projects")
+    ap.add_argument("--severity", choices=["error", "warning", "all"], default="error")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("bundle_hint", nargs="?", default=None)
+    ap.add_argument("--config", help="MCP config file path (overrides discovery)")
+    args = ap.parse_args()
+
+    config_path = mcp.pick_config(args.config, args.bundle_hint)
+    arguments = {"severity": args.severity}
+    if args.projects:
+        arguments["projects"] = args.projects
+    text, is_error = mcp.call(config_path, "get_problems", arguments)
+
+    groups = group_by_project(text)
+    if args.json:
+        print(json.dumps(groups, indent=2))
+    elif not groups:
+        print(text)
+    else:
+        for project in sorted(groups):
+            print(project + ":")
+            print("\n".join(groups[project]))
+            print()
+    return 1 if is_error else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -66,6 +66,14 @@ public class PomPropertyReader {
 	}
 
 	/**
+	 * Derives the BlueMind repo root ({@code <root>/global/pom.xml} walked up
+	 * three levels) from {@link #findGlobalPom()}.
+	 */
+	public static Optional<Path> findRepoRoot() {
+		return findGlobalPom().map(pom -> pom.getParent().getParent().getParent());
+	}
+
+	/**
 	 * Parses the POM XML and extracts the three key properties, resolving
 	 * {@code ${docker.devenv.tag}} within {@code tycho.testArgLine}.
 	 */

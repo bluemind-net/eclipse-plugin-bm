@@ -1,12 +1,14 @@
 # BlueMind Developer Tools — Plugin Eclipse
 
-Plugin Eclipse pour le développement BlueMind. Il fournit cinq fonctionnalités :
+Plugin Eclipse pour le développement BlueMind. Nouveau sur ce plugin ? [ONBOARDING.md](ONBOARDING.md)
+fait le tour en quelques minutes. Il fournit six fonctionnalités :
 
 - **Lancement rapide des tests** : clic droit sur un projet `*.tests` pour lancer les JUnit Plugin Tests avec une configuration préconfigurée.
 - **Synchronisation POM → workspace** : détecte automatiquement les changements dans `open/global/pom.xml` (via inotify) et propose de mettre à jour la configuration Eclipse en conséquence.
 - **Serveur MCP pour Claude Code** : expose un endpoint HTTP JSON-RPC local (loopback + token) permettant à Claude Code de déclencher des tests dans l'Eclipse qui tourne et de récupérer stdout/stderr + outcome. Voir [docs/CLAUDE_CODE_MCP.md](net.bluemind.devtools/docs/CLAUDE_CODE_MCP.md).
 - **Vue « Branch Changed Files »** : liste les fichiers modifiés sur la branche courante par rapport au merge-base avec l'upstream (committed / staged / unstaged), avec ouverture du fichier ou de l'éditeur de comparaison. Menu *Window → Show View → BlueMind → Branch Changed Files*.
 - **Interactive Code Review (ICR)** : revue de code interactive native. On sélectionne du code dans un éditeur, *clic droit → Ask Claude (ICR)…* (ou `Ctrl+Alt+C`) pour poser une question ou demander une modification ; Claude (skill `/icr`) écoute via le serveur MCP, agit, et répond inline sous forme de fil de commentaires (glyphe `💬`). Voir [docs/CLAUDE_CODE_MCP.md](net.bluemind.devtools/docs/CLAUDE_CODE_MCP.md) §5.
+- **Gestion du workspace** : sync des projets et des working sets avec le disque, diagnostic/réparation des erreurs de compilation, depuis Claude Code (skills `eclipse-sync` / `eclipse-doctor`). Toute modification du workspace (import, retrait, working sets) passe par un consentement utilisateur. Voir [docs/CLAUDE_CODE_MCP.md](net.bluemind.devtools/docs/CLAUDE_CODE_MCP.md) §6.
 
 ## Installation
 
@@ -89,6 +91,49 @@ est fournie dans ce dépôt : [`.claude/commands/icr.md`](.claude/commands/icr.m
 
 > La commande `/icr` est documentée pas à pas dans le fichier lui-même ; le détail du protocole MCP
 > est dans [docs/CLAUDE_CODE_MCP.md](net.bluemind.devtools/docs/CLAUDE_CODE_MCP.md) §5.
+
+## Gestion du workspace — skills `eclipse-sync` / `eclipse-doctor`
+
+Depuis Claude Code, deux skills gèrent le workspace Eclipse : `eclipse-sync` (import/retrait de
+projets, working sets) et `eclipse-doctor` (diagnostic et réparation des erreurs de compilation).
+Toute modification (import, retrait de projet, working sets) passe par un consentement utilisateur
+— préférences `workspace.consent.projects` / `workspace.consent.workingsets`
+(**Window → Preferences → BlueMind**, `ask` / `always` / `never`).
+
+### Mise en place
+
+1. **Activer le serveur MCP** (cf. ci-dessus, même préférence que pour ICR).
+2. **Installer les scripts et les skills.** Les skills appellent les scripts par leur nom nu
+   (`bm-eclipse-doctor`, …) : le répertoire d'installation doit donc être dans le `PATH`. Choisissez
+   le vôtre — ici `~/tools/scripts/claude` :
+   ```bash
+   BM_SCRIPTS=~/tools/scripts/claude          # doit être dans le PATH
+   mkdir -p "$BM_SCRIPTS" ~/.claude/skills/eclipse-sync ~/.claude/skills/eclipse-doctor
+   cp .claude/scripts/eclipse/* "$BM_SCRIPTS"/    # ou: ln -sf "$PWD"/.claude/scripts/eclipse/* "$BM_SCRIPTS"/
+   cp .claude/skills/eclipse-sync/SKILL.md ~/.claude/skills/eclipse-sync/
+   cp .claude/skills/eclipse-doctor/SKILL.md ~/.claude/skills/eclipse-doctor/
+   chmod +x "$BM_SCRIPTS"/bm-*
+   ```
+   Puis autoriser ces scripts dans `~/.claude/settings.json`, formes tilde **et** absolue :
+   `Bash(~/tools/scripts/claude/*)` et `Bash(/home/<vous>/tools/scripts/claude/*)`.
+
+### Utilisation
+
+Quatre mots courts suffisent à couvrir l'essentiel (détail dans les `SKILL.md` respectifs, § Vocabulaire) :
+
+| Mot | Fait quoi | Skill |
+|---|---|---|
+| **sync** | sync des projets seuls (import/retrait) | `eclipse-sync` |
+| **orga** | sync des working sets seuls | `eclipse-sync` |
+| **repair** | répare les erreurs déjà là, sans sync | `eclipse-doctor` |
+| **prepare** | la totale : sync projets + working sets + repair en un appel ; « prepare `<cible>` » (ex. « prepare mapi ») ouvre en plus `<cible>` dans le même appel | `eclipse-doctor` |
+
+Ces mots ne sont pas exclusifs — les formulations naturelles marchent aussi (« j'ai changé de
+branche », « ça compile pas dans eclipse », « je vais bosser sur X »). Un tour d'horizon complet
+est dans [ONBOARDING.md](ONBOARDING.md).
+
+Détail des tools MCP de gestion du workspace, du diagnostic et du protocole dans
+[docs/CLAUDE_CODE_MCP.md](net.bluemind.devtools/docs/CLAUDE_CODE_MCP.md) §6.
 
 ## Build local
 

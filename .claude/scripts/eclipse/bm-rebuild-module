@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+"""bm-rebuild-module — targeted Maven rebuild of module(s), then Eclipse refresh.
+
+Runs ONE Maven reactor for all the given artifacts:
+`./mvnw -T1C -nsu -Dmaven.test.skip=true [-P <union of profiles>] -pl :<a>,:<b>,…
+clean install` in the repo of the targeted Eclipse instance (repoRoot from
+workspace_info, not the current directory), then calls refresh_projects on the
+rebuilt modules via MCP (unless --no-refresh). No `-am` unless the reactor fails
+without it — upstream artifacts are already in ~/.m2 in the common case. A single
+reactor lets Maven order the modules by dependency (e.g. an api before its
+api.gwt) instead of N separate invocations.
+
+Usage:
+  bm-rebuild-module <artifactId> [<artifactId> ...] [bundle-hint] [--repo PATH]
+                    [--config PATH] [--no-refresh]
+"""
+import argparse
+import os
+import subprocess
+import sys
+import time
+import xml.etree.ElementTree as ET
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _eclipse_mcp as mcp
+
+POM_NS = {"m": "http://maven.apache.org/POM/4.0.0"}
+SKIP_DIRS = {".git", "node_modules", "target", "bin", ".metadata"}
+# When a module is gated behind several profiles at the same level (e.g. open/ui
+# is under both "fast" and "full"), prefer this one — it's the lighter build.
+PREFERRED_PROFILE = "fast"
+
+
+def module_gating_profile(parent_pom, child_name):
+    """Look at parent_pom's <modules>: return None if child_name is a plain
+    top-level <module> (always in the reactor), or the id of the <profile>
+    that must be active for the reactor to see it. When several profiles gate
+    the same module, PREFERRED_PROFILE wins, else the first one found."""
+    try:
+        root = ET.parse(parent_pom).getroot()
+    except (ET.ParseError, OSError):
+        return None
+    for module in root.findall("m:modules/m:module", POM_NS):
+        if module.text and module.text.strip().split("/")[0] == child_name:
+            return None  # plain module, no profile needed
+    gating = []
+    for profile in root.findall("m:profiles/m:profile", POM_NS):
+        id_el = profile.find("m:id", POM_NS)
+        if id_el is None or not id_el.text:
+            continue
+        for module in profile.findall(".//m:modules/m:module", POM_NS):
+            if module.text and module.text.strip().split("/")[0] == child_name:
+                gating.append(id_el.text.strip())
+    if not gating:
+        return None
+    return PREFERRED_PROFILE if PREFERRED_PROFILE in gating else gating[0]
+
+
+def guess_profile(repo, module_dir):
+    """Walk up from the module directory to the repo root; at each pom.xml
+    traversed, accumulate the profile (if any) that makes the child segment
+    visible in the reactor. Fully driven by the real poms — no hard-coded
+    paths — so arbitrary nesting depth is handled (e.g. closed/ad/*.gwt needs
+    both 'closed' from the root pom and 'full' from closed/ad/pom.xml)."""
+    if module_dir is None:
+        return None
+    repo = os.path.abspath(repo)
+    current = os.path.abspath(module_dir)
+    profiles = []
+    while current != repo and current.startswith(repo):
+        parent = os.path.dirname(current)
+        parent_pom = os.path.join(parent, "pom.xml")
+        if os.path.isfile(parent_pom):
+            profile = module_gating_profile(parent_pom, os.path.basename(current))
+            if profile and profile not in profiles:
+                profiles.append(profile)
+        current = parent
+    return ",".join(profiles) if profiles else None
+
+
+def find_module_dir(repo, artifact_id):
+    for dirpath, dirnames, filenames in os.walk(repo):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        if "pom.xml" in filenames:
+            try:
+                root = ET.parse(os.path.join(dirpath, "pom.xml")).getroot()
+                el = root.find("m:artifactId", POM_NS)
+                if el is not None and el.text and el.text.strip() == artifact_id:
+                    return dirpath
+            except ET.ParseError:
+                pass
+    return None
+
+
+def rebuild(repo, artifacts):
+    """Build every artifact in a SINGLE Maven reactor. Maven orders them by
+    dependency, so listing e.g. `foo.api foo.api.gwt` builds the api first.
+    The profile set is the union of what each module needs to be visible in the
+    reactor (a `-pl` list restricts the build to the named modules, so activating
+    extra profiles only widens visibility, it never pulls in unwanted modules).
+    Returns (ok, resolved) — resolved is the subset actually found on disk.
+
+    No `-am` by default: the upstream artifacts are already in ~/.m2 in the common
+    case, and building them anyway was 55 modules for 12 requested (43.3s of a 46.4s
+    reactor). Retried once WITH `-am` only if the reactor fails — the uncommon case
+    where something upstream really is missing from the local repo. `-nsu`: nothing
+    here waits on a remote snapshot check either."""
+    resolved = []
+    profiles = []
+    for artifact_id in artifacts:
+        module_dir = find_module_dir(repo, artifact_id)
+        if module_dir is None:
+            print(f"FAILED — {artifact_id}: not found in reactor under {repo}")
+            continue
+        resolved.append(artifact_id)
+        for p in (guess_profile(repo, module_dir) or "").split(","):
+            if p and p not in profiles:
+                profiles.append(p)
+
+    if not resolved:
+        return False, []
+
+    base_cmd = ["./mvnw", "-T1C", "-nsu", "-Dmaven.test.skip=true"]
+    if profiles:
+        base_cmd += ["-P", ",".join(profiles)]
+    tail = ["-pl", ",".join(f":{a}" for a in resolved), "clean", "install"]
+
+    cmd = base_cmd + tail
+    print(f"$ {' '.join(cmd)}  (cwd={repo})")
+    start = time.monotonic()
+    result = subprocess.run(cmd, cwd=repo)
+    duration = time.monotonic() - start
+    ok = result.returncode == 0
+
+    if not ok:
+        print(f"FAILED without -am in {duration:.1f}s — retrying with -am"
+              " (missing upstream artifact in ~/.m2?)")
+        cmd = base_cmd + ["-am"] + tail
+        print(f"$ {' '.join(cmd)}  (cwd={repo})")
+        start = time.monotonic()
+        result = subprocess.run(cmd, cwd=repo)
+        duration = time.monotonic() - start
+        ok = result.returncode == 0
+
+    print(f"{'OK' if ok else 'FAILED'} — {', '.join(resolved)} in {duration:.1f}s")
+    return ok, resolved
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("artifacts", nargs="+", help="Maven artifactId(s) to rebuild")
+    ap.add_argument("bundle_hint", nargs="?", default=None)
+    ap.add_argument("--repo", help="Repo root (default: repoRoot from workspace_info)")
+    ap.add_argument("--config", help="MCP config file path (overrides discovery)")
+    ap.add_argument("--no-refresh", action="store_true",
+                    help="skip refresh_projects after the build — for a caller that folds"
+                         " the refresh into its own single Eclipse batch (bm-eclipse-doctor)")
+    args = ap.parse_args()
+
+    config_path = mcp.pick_config(args.config, args.bundle_hint)
+    repo = args.repo
+    if not repo:
+        text, _ = mcp.call(config_path, "workspace_info", {})
+        info = mcp.extract_json_block(text)
+        repo = info.get("repoRoot") if info else None
+        if not repo:
+            mcp.die("could not derive repo root from workspace_info; pass --repo")
+
+    all_ok, resolved = rebuild(repo, args.artifacts)
+    print()
+
+    if not resolved:
+        return 1
+    if args.no_refresh:
+        return 0 if all_ok and len(resolved) == len(args.artifacts) else 1
+    text, is_error = mcp.call(config_path, "refresh_projects", {"projects": resolved})
+    print(text)
+    return 0 if all_ok and len(resolved) == len(args.artifacts) and not is_error else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

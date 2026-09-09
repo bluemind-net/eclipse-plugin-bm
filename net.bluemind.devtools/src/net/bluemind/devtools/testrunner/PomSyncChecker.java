@@ -58,11 +58,11 @@ public class PomSyncChecker {
 			PomProperties pomProps,
 			WorkspaceConfig workspaceConfig) {
 
-		boolean hasMismatch() {
+		public boolean hasMismatch() {
 			return vmArgsMismatch || targetPlatformMismatch;
 		}
 
-		boolean hasLocalJvmOptions() {
+		public boolean hasLocalJvmOptions() {
 			return localJvmOptions != null && !localJvmOptions.isEmpty();
 		}
 	}
@@ -123,7 +123,7 @@ public class PomSyncChecker {
 		});
 	}
 
-	static SyncStatus computeStatus() {
+	public static SyncStatus computeStatus() {
 		var pomPathOpt = PomPropertyReader.findGlobalPom();
 		if (pomPathOpt.isEmpty()) {
 			return null;
