@@ -1,12 +1,19 @@
 package net.bluemind.devtools.testrunner;
 
 import java.io.File;
+import java.io.IOException;
 import java.io.StringReader;
 import java.io.StringWriter;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.Properties;
 import java.util.StringJoiner;
 import java.util.function.BooleanSupplier;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import javax.xml.parsers.DocumentBuilderFactory;
 import javax.xml.transform.OutputKeys;
@@ -17,10 +24,12 @@ import javax.xml.transform.stream.StreamResult;
 
 import org.eclipse.core.resources.ResourcesPlugin;
 import org.eclipse.core.runtime.CoreException;
+import org.eclipse.core.runtime.FileLocator;
 import org.eclipse.core.runtime.ILog;
 import org.eclipse.core.runtime.IProgressMonitor;
 import org.eclipse.core.runtime.IStatus;
 import org.eclipse.core.runtime.NullProgressMonitor;
+import org.eclipse.core.runtime.OperationCanceledException;
 import org.eclipse.core.runtime.Platform;
 import org.eclipse.core.runtime.Status;
 import org.eclipse.core.runtime.jobs.Job;
@@ -35,6 +44,7 @@ import org.eclipse.swt.widgets.Display;
 import org.eclipse.swt.widgets.Shell;
 import org.eclipse.ui.IWorkbenchWindow;
 import org.eclipse.ui.PlatformUI;
+import org.osgi.framework.Bundle;
 import org.osgi.service.prefs.BackingStoreException;
 import org.osgi.service.prefs.Preferences;
 import org.w3c.dom.Document;
@@ -43,6 +53,7 @@ import org.w3c.dom.NodeList;
 import org.xml.sax.InputSource;
 
 import net.bluemind.devtools.Activator;
+import net.bluemind.devtools.testrunner.mcp.BmMcpConfigFile;
 import net.bluemind.devtools.testrunner.mcp.BmMcpTools;
 
 /**
@@ -158,52 +169,87 @@ public class WorkspaceSetup {
 				.orElse(null);
 	}
 
+	/**
+	 * Ticks handed to {@link IProgressMonitor#beginTask}, sized so the sum along
+	 * whichever branch actually runs adds up to 100 — the fresh-workspace branch
+	 * (import + doctor repair) dominates the total since it's the only slow one.
+	 */
+	private static final int WORK_PREFS = 2;
+	private static final int WORK_IMPORT = 50;
+	private static final int WORK_LICENSE_SAVE = 3;
+	private static final int WORK_JDK = 5;
+	private static final int WORK_POM_SYNC = 5;
+	private static final int WORK_DOCTOR = 35;
+
 	private static void schedule(Path repoRoot, boolean interactive) {
 		Job job = new Job("Setting up BlueMind Eclipse workspace") {
 			@Override
 			protected IStatus run(IProgressMonitor monitor) {
-				StringJoiner summary = new StringJoiner("\n");
-				// Disabled first, before any project is touched: the Marketplace nature
-				// detector reacts to the resource-change events importAndOrganize() is
-				// about to fire and can pop its dialog within seconds of the first
-				// import — well before this job would otherwise get around to disabling
-				// it, since importing ~1400 projects takes a minute or more.
-				// Both run on the UI thread: their property-change listeners
-				// (WorkbenchViewerSetup, MissingNatureDetector) touch SWT widgets
-				// directly and would throw "Invalid thread access" from this Job.
-				if (runOnUiThread(WorkspaceSetup::applyDisableViewPagination)) {
-					summary.add("Disabled the \"show remaining items\" limit in tree/table views.");
-				}
-				if (runOnUiThread(WorkspaceSetup::applyDisableMarketplaceSolutions)) {
-					summary.add("Disabled the Marketplace solution popup for missing project natures.");
-				}
-				if (ResourcesPlugin.getWorkspace().getRoot().getProjects().length == 0) {
-					importAndOrganize(repoRoot, summary);
-				}
-				if (applyLicenseHeader()) {
-					summary.add("License header template configured.");
-				}
-				if (applySaveActions()) {
-					summary.add("Organize imports + format on save configured.");
-				}
-				applyJdk(summary);
-				applyPomSync(summary);
+				monitor.beginTask("Setting up BlueMind Eclipse workspace", 100);
+				try {
+					StringJoiner summary = new StringJoiner("\n");
+					// Disabled first, before any project is touched: the Marketplace nature
+					// detector reacts to the resource-change events importAndOrganize() is
+					// about to fire and can pop its dialog within seconds of the first
+					// import — well before this job would otherwise get around to disabling
+					// it, since importing ~1400 projects takes a minute or more.
+					// Both run on the UI thread: their property-change listeners
+					// (WorkbenchViewerSetup, MissingNatureDetector) touch SWT widgets
+					// directly and would throw "Invalid thread access" from this Job.
+					monitor.subTask("Configuring view and Marketplace preferences...");
+					if (runOnUiThread(WorkspaceSetup::applyDisableViewPagination)) {
+						summary.add("Disabled the \"show remaining items\" limit in tree/table views.");
+					}
+					if (runOnUiThread(WorkspaceSetup::applyDisableMarketplaceSolutions)) {
+						summary.add("Disabled the Marketplace solution popup for missing project natures.");
+					}
+					monitor.worked(WORK_PREFS);
 
-				Activator.getDefault().getPreferenceStore().setValue(Activator.PREF_WORKSPACE_SETUP_DONE, true);
-				LOG.info("Workspace setup done for " + repoRoot + ": "
-						+ (summary.length() == 0 ? "nothing to change" : summary.toString().replace('\n', ' ')));
+					boolean freshWorkspace = ResourcesPlugin.getWorkspace().getRoot().getProjects().length == 0;
+					if (freshWorkspace) {
+						importAndOrganize(repoRoot, summary, monitor);
+					}
 
-				if (interactive) {
-					String text = summary.length() == 0 ? "Nothing to change — already up to date."
-							: summary.toString();
-					Display.getDefault().asyncExec(() -> {
-						Shell shell = activeShell();
-						if (shell != null) {
-							MessageDialog.openInformation(shell, "BlueMind Workspace Setup", text);
-						}
-					});
+					monitor.subTask("Configuring license header and save actions...");
+					if (applyLicenseHeader()) {
+						summary.add("License header template configured.");
+					}
+					if (applySaveActions()) {
+						summary.add("Organize imports + format on save configured.");
+					}
+					monitor.worked(WORK_LICENSE_SAVE);
+
+					monitor.subTask("Configuring JDK...");
+					applyJdk(summary);
+					monitor.worked(WORK_JDK);
+
+					monitor.subTask("Syncing target platform from POM...");
+					applyPomSync(summary);
+					monitor.worked(WORK_POM_SYNC);
+
+					if (freshWorkspace) {
+						applyDoctorRepair(summary, monitor);
+						monitor.worked(WORK_DOCTOR);
+					}
+
+					Activator.getDefault().getPreferenceStore().setValue(Activator.PREF_WORKSPACE_SETUP_DONE, true);
+					LOG.info("Workspace setup done for " + repoRoot + ": "
+							+ (summary.length() == 0 ? "nothing to change" : summary.toString().replace('\n', ' ')));
+
+					if (interactive) {
+						String text = summary.length() == 0 ? "Nothing to change — already up to date."
+								: summary.toString();
+						Display.getDefault().asyncExec(() -> {
+							Shell shell = activeShell();
+							if (shell != null) {
+								MessageDialog.openInformation(shell, "BlueMind Workspace Setup", text);
+							}
+						});
+					}
+					return Status.OK_STATUS;
+				} finally {
+					monitor.done();
 				}
-				return Status.OK_STATUS;
 			}
 		};
 		job.setUser(interactive);
@@ -218,7 +264,11 @@ public class WorkspaceSetup {
 	 * job nobody is watching, so a still-default "ask" is elevated to "always"
 	 * for the duration of this call only; an explicit "never" is left as is.
 	 */
-	private static void importAndOrganize(Path repoRoot, StringJoiner summary) {
+	/** Ticks for the two sub-steps below, out of {@link #WORK_IMPORT}. */
+	private static final int WORK_IMPORT_PROJECTS = 40;
+	private static final int WORK_IMPORT_WORKING_SETS = WORK_IMPORT - WORK_IMPORT_PROJECTS;
+
+	private static void importAndOrganize(Path repoRoot, StringJoiner summary, IProgressMonitor monitor) {
 		var store = Activator.getDefault().getPreferenceStore();
 		String savedProjectsConsent = store.getString(Activator.PREF_CONSENT_PROJECTS);
 		String savedWorkingSetsConsent = store.getString(Activator.PREF_CONSENT_WORKINGSETS);
@@ -229,15 +279,20 @@ public class WorkspaceSetup {
 			store.setValue(Activator.PREF_CONSENT_WORKINGSETS, "always");
 		}
 		try {
+			monitor.subTask("Importing projects from " + repoRoot + " (can take several minutes)...");
 			// Not necessarily importResult.ok(): syncProjects also flags pending compile
 			// errors as an "issue", which is the expected state right after import —
 			// nothing has a target platform yet. applyPomSync() (called after this)
 			// fixes that; a genuine import failure would still show up in this summary.
 			var importResult = BmMcpTools.syncProjects(repoRoot.toString(), true, true);
 			summary.add("Projects imported from " + repoRoot + " — " + firstLine(importResult.markdown()));
+			monitor.worked(WORK_IMPORT_PROJECTS);
+
+			monitor.subTask("Organizing working sets...");
 			var workingSetsResult = BmMcpTools.syncWorkingSets(repoRoot.toString(), true, false, null);
 			summary.add("Working sets: " + (workingSetsResult.ok() ? "organized"
 					: "organize failed — " + firstLine(workingSetsResult.markdown())));
+			monitor.worked(WORK_IMPORT_WORKING_SETS);
 		} finally {
 			store.setValue(Activator.PREF_CONSENT_PROJECTS, savedProjectsConsent);
 			store.setValue(Activator.PREF_CONSENT_WORKINGSETS, savedWorkingSetsConsent);
@@ -447,6 +502,105 @@ public class WorkspaceSetup {
 		}
 		if (status.targetPlatformMismatch()) {
 			summary.add("Target platform " + (hadTarget ? "updated" : "created") + " from POM (loading in background).");
+		}
+	}
+
+	private static final Pattern DOCTOR_END_LINE = Pattern.compile("\\[doctor:end\\].*");
+
+	/**
+	 * Runs the same mechanical repair pass a human would trigger by hand with
+	 * {@code bm-eclipse-doctor --sync --apply}: on a workspace that has never been
+	 * built, the vast majority of the ~1000+ initial errors are stale build order
+	 * and missing generated source folders — both purely mechanical (clean /
+	 * external Maven rebuild), decided from PDE facts, never from a message shape.
+	 * That decision loop lives in the Python script bundled at
+	 * {@code scripts/eclipse/bm-eclipse-doctor} (a symlink to {@code .claude/scripts/eclipse},
+	 * this repo's single source of truth for it — kept in Python rather than ported
+	 * to Java so it stays the one implementation both Claude Code and this bootstrap
+	 * call). It talks to this same running Eclipse instance over the MCP HTTP
+	 * server {@link BmMcpConfigFile} just wrote, so it needs that server enabled
+	 * (on by default) and a {@code python3} on PATH.
+	 *
+	 * <p>
+	 * {@link #applyPomSync} above only *schedules* the target platform reload
+	 * (asynchronously) — this waits for the build and target-platform-resolution
+	 * jobs first, so the doctor's facts are read against a resolved target
+	 * platform, not an empty one. Deliberately joins those specific families
+	 * rather than {@code null} ("every job"): this method runs on the setup
+	 * job's own worker thread, and {@code null} matches every job regardless of
+	 * its {@code belongsTo()} — including the still-{@code RUNNING} setup job
+	 * itself, which self-deadlocks since it can't finish until join() returns.
+	 */
+	private static final String PDE_TARGET_JOB_FAMILY = "LoadTargetDefinitionJob";
+
+	private static void applyDoctorRepair(StringJoiner summary, IProgressMonitor monitor) {
+		if (!Activator.getDefault().getPreferenceStore().getBoolean(Activator.PREF_MCP_ENABLED)) {
+			summary.add("Doctor repair skipped — MCP server disabled (BlueMind preferences).");
+			return;
+		}
+		monitor.subTask("Waiting for pending background jobs before running bm-eclipse-doctor...");
+		try {
+			Job.getJobManager().join(ResourcesPlugin.FAMILY_AUTO_BUILD, new NullProgressMonitor());
+			Job.getJobManager().join(ResourcesPlugin.FAMILY_MANUAL_BUILD, new NullProgressMonitor());
+			Job.getJobManager().join(PDE_TARGET_JOB_FAMILY, new NullProgressMonitor());
+		} catch (OperationCanceledException e) {
+			return;
+		} catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+			return;
+		}
+
+		File script = resolveScript("bm-eclipse-doctor");
+		if (script == null) {
+			summary.add("Doctor repair skipped — bm-eclipse-doctor not found in the plugin bundle.");
+			return;
+		}
+		Path config = BmMcpConfigFile.configPath();
+		if (!Files.isReadable(config)) {
+			summary.add("Doctor repair skipped — no MCP config written yet.");
+			return;
+		}
+
+		List<String> command = List.of("python3", script.getAbsolutePath(), "--sync", "--apply", "--config",
+				config.toString());
+		try {
+			monitor.subTask("Running bm-eclipse-doctor --sync --apply...");
+			Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
+			String output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+			int rc = process.waitFor();
+			LOG.info("bm-eclipse-doctor --sync --apply (exit " + rc + "):\n" + output);
+			Matcher endLine = DOCTOR_END_LINE.matcher(output);
+			if (endLine.find()) {
+				summary.add("Doctor repair: " + endLine.group());
+			} else {
+				summary.add("Doctor repair " + (rc == 0 ? "done" : "exited " + rc)
+						+ " — see the error log for bm-eclipse-doctor's output.");
+			}
+		} catch (IOException e) {
+			summary.add("Doctor repair skipped — could not run python3: " + e.getMessage());
+		} catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+		}
+	}
+
+	/**
+	 * Resolves a script shipped under {@code scripts/eclipse/} in this bundle to a real file path.
+	 * Extracts the whole directory (not just the requested file) so sibling modules the script
+	 * imports (e.g. {@code _eclipse_mcp.py}) land next to it on disk.
+	 */
+	private static File resolveScript(String name) {
+		Bundle bundle = Activator.getDefault().getBundle();
+		URL dirEntry = bundle.getEntry("scripts/eclipse/");
+		if (dirEntry == null) {
+			return null;
+		}
+		try {
+			File dir = new File(FileLocator.toFileURL(dirEntry).getFile());
+			File script = new File(dir, name);
+			return script.isFile() ? script : null;
+		} catch (IOException e) {
+			LOG.error("Failed to resolve " + name + " from the plugin bundle", e);
+			return null;
 		}
 	}
 
