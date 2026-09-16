@@ -10,6 +10,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.EnumSet;
 import java.util.List;
+import java.util.Optional;
 import java.util.Properties;
 import java.util.StringJoiner;
 import java.util.function.BooleanSupplier;
@@ -42,6 +43,7 @@ import org.eclipse.jdt.launching.JavaRuntime;
 import org.eclipse.jdt.launching.VMStandin;
 import org.eclipse.jface.dialogs.MessageDialog;
 import org.eclipse.jface.window.Window;
+import org.eclipse.swt.widgets.DirectoryDialog;
 import org.eclipse.swt.widgets.Display;
 import org.eclipse.swt.widgets.Shell;
 import org.eclipse.ui.IWorkbenchWindow;
@@ -185,10 +187,10 @@ public class WorkspaceSetup {
 			return;
 		}
 		if (repoRoot == null) {
-			MessageDialog.openInformation(shell, "BlueMind Workspace Setup",
-					"No BlueMind repository found. Open a project from a BlueMind checkout first, "
-							+ "or create the workspace inside a repo worktree.");
-			return;
+			repoRoot = promptForRepoRoot(shell);
+			if (repoRoot == null) {
+				return;
+			}
 		}
 		WorkspaceSetupDialog dialog = new WorkspaceSetupDialog(shell);
 		if (dialog.open() != Window.OK) {
@@ -204,6 +206,40 @@ public class WorkspaceSetup {
 	private static Path bootstrapRepoRoot() {
 		return PomPropertyReader.findRepoRoot().or(PomPropertyReader::findRepoRootFromWorkspaceLocation)
 				.orElse(null);
+	}
+
+	/**
+	 * Auto-detection ({@link #bootstrapRepoRoot()}) found nothing — asks the user
+	 * to browse to their BlueMind checkout instead. Loops on an invalid pick
+	 * (no {@code global/pom.xml} found walking up from it) until a valid one is
+	 * chosen or the dialog is cancelled.
+	 */
+	private static Path promptForRepoRoot(Shell shell) {
+		var store = Activator.getDefault().getPreferenceStore();
+		String startPath = store.getString(Activator.PREF_LAST_REPO_ROOT);
+		if (startPath.isEmpty()) {
+			startPath = System.getProperty("user.home");
+		}
+		String message = "No BlueMind repository found. Select the root folder of your bluemind-all "
+				+ "checkout (or its \"open\" subfolder).";
+		while (true) {
+			DirectoryDialog browser = new DirectoryDialog(shell);
+			browser.setText("BlueMind Workspace Setup");
+			browser.setMessage(message);
+			browser.setFilterPath(startPath);
+			String picked = browser.open();
+			if (picked == null) {
+				return null;
+			}
+			Optional<Path> repoRoot = PomPropertyReader.findRepoRootFrom(Path.of(picked));
+			if (repoRoot.isPresent()) {
+				store.setValue(Activator.PREF_LAST_REPO_ROOT, picked);
+				return repoRoot.get();
+			}
+			startPath = picked;
+			message = "No BlueMind repository found under \"" + picked + "\". Select the root folder of "
+					+ "your bluemind-all checkout (or its \"open\" subfolder).";
+		}
 	}
 
 	/**

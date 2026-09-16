@@ -84,6 +84,17 @@ public class PomPropertyReader {
 	}
 
 	/**
+	 * Same lookup as {@link #findRepoRoot()}, but starting from an arbitrary
+	 * user-picked directory instead of a workspace project location — used by
+	 * the "Setup Eclipse Workspace..." folder browser to validate a manual pick.
+	 */
+	public static Optional<Path> findRepoRootFrom(Path start) {
+		Optional<Path> found = walkUpForGlobalPom(start);
+		found.ifPresent(pom -> cachedPomPath = pom);
+		return found.map(pom -> pom.getParent().getParent().getParent());
+	}
+
+	/**
 	 * Walks up from {@code start} looking for {@code global/pom.xml} as a direct
 	 * child (matches a starting point already inside {@code open/}, e.g. a
 	 * project location) or as a child of {@code open/} (matches a starting point
