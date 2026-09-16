@@ -8,6 +8,7 @@ import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.EnumSet;
 import java.util.List;
 import java.util.Properties;
 import java.util.StringJoiner;
@@ -40,6 +41,7 @@ import org.eclipse.jdt.launching.IVMInstallType;
 import org.eclipse.jdt.launching.JavaRuntime;
 import org.eclipse.jdt.launching.VMStandin;
 import org.eclipse.jface.dialogs.MessageDialog;
+import org.eclipse.jface.window.Window;
 import org.eclipse.swt.widgets.Display;
 import org.eclipse.swt.widgets.Shell;
 import org.eclipse.ui.IWorkbenchWindow;
@@ -57,13 +59,36 @@ import net.bluemind.devtools.testrunner.mcp.BmMcpConfigFile;
 import net.bluemind.devtools.testrunner.mcp.BmMcpTools;
 
 /**
- * One-time BlueMind Eclipse workspace bootstrap: license header code template,
- * "organize imports + format" on save, default JDK, and — for a workspace with
- * no project yet (typically a fresh {@code -data} created inside a repo
- * worktree) — project import and working sets. VM arguments and the target
- * platform are handled separately by {@link PomSyncChecker}.
+ * BlueMind Eclipse workspace bootstrap: license header code template,
+ * "organize imports + format" on save, default JDK, project import and
+ * working sets, and a bm-eclipse-doctor repair pass. Runs automatically once
+ * (typically on a fresh {@code -data} created inside a repo worktree); each
+ * step can also be re-run on demand, individually, via "BlueMind > Setup
+ * Eclipse Workspace...". VM arguments and the target platform are handled
+ * separately by {@link PomSyncChecker}.
  */
 public class WorkspaceSetup {
+
+	/**
+	 * One entry per bootstrap step, shown as a checkbox in the "Setup Eclipse
+	 * Workspace..." dialog so any step can be forced to run again on demand
+	 * (e.g. after a JDK reinstall) instead of only ever running once.
+	 */
+	public enum Step {
+		UI_PREFS("View and Marketplace preferences (item limit, missing-nature popup)"),
+		IMPORT_PROJECTS("Import projects and organize working sets"),
+		LICENSE_HEADER("License header code template"),
+		SAVE_ACTIONS("Organize imports + format on save"),
+		JDK("JDK detection and compiler compliance"),
+		POM_SYNC("VM arguments and target platform (from POM)"),
+		DOCTOR("bm-eclipse-doctor --sync --apply");
+
+		final String label;
+
+		Step(String label) {
+			this.label = label;
+		}
+	}
 
 	private static final ILog LOG = Platform.getLog(WorkspaceSetup.class);
 
@@ -141,27 +166,39 @@ public class WorkspaceSetup {
 						: "This will configure ")
 				+ "the license header, save actions, JDK, compiler settings and target platform.";
 		if (MessageDialog.openQuestion(activeShell(), "BlueMind Workspace Setup", message)) {
-			schedule(repoRoot, true);
+			schedule(repoRoot, true, EnumSet.allOf(Step.class));
 		} else {
 			Activator.getDefault().getPreferenceStore().setValue(Activator.PREF_WORKSPACE_SETUP_DONE, true);
 		}
 	}
 
-	/** Re-runs everything on demand — the "BlueMind > Setup Eclipse Workspace..." command. */
+	/**
+	 * Lets the user pick which steps to (re)run — the "BlueMind > Setup Eclipse
+	 * Workspace..." command. Everything is checked by default: this is also how
+	 * a single step (a fresh JDK install, a broken save-actions profile...) gets
+	 * forced to run again after the initial bootstrap.
+	 */
 	public static void runManual() {
 		Path repoRoot = bootstrapRepoRoot();
-		if (repoRoot == null) {
-			Display.getDefault().asyncExec(() -> {
-				Shell shell = activeShell();
-				if (shell != null) {
-					MessageDialog.openInformation(shell, "BlueMind Workspace Setup",
-							"No BlueMind repository found. Open a project from a BlueMind checkout first, "
-									+ "or create the workspace inside a repo worktree.");
-				}
-			});
+		Shell shell = activeShell();
+		if (shell == null) {
 			return;
 		}
-		schedule(repoRoot, true);
+		if (repoRoot == null) {
+			MessageDialog.openInformation(shell, "BlueMind Workspace Setup",
+					"No BlueMind repository found. Open a project from a BlueMind checkout first, "
+							+ "or create the workspace inside a repo worktree.");
+			return;
+		}
+		WorkspaceSetupDialog dialog = new WorkspaceSetupDialog(shell);
+		if (dialog.open() != Window.OK) {
+			return;
+		}
+		EnumSet<Step> steps = dialog.getSelectedSteps();
+		if (steps.isEmpty()) {
+			return;
+		}
+		schedule(repoRoot, true, steps);
 	}
 
 	private static Path bootstrapRepoRoot() {
@@ -181,7 +218,7 @@ public class WorkspaceSetup {
 	private static final int WORK_POM_SYNC = 5;
 	private static final int WORK_DOCTOR = 35;
 
-	private static void schedule(Path repoRoot, boolean interactive) {
+	private static void schedule(Path repoRoot, boolean interactive, EnumSet<Step> steps) {
 		Job job = new Job("Setting up BlueMind Eclipse workspace") {
 			@Override
 			protected IStatus run(IProgressMonitor monitor) {
@@ -196,41 +233,46 @@ public class WorkspaceSetup {
 					// Both run on the UI thread: their property-change listeners
 					// (WorkbenchViewerSetup, MissingNatureDetector) touch SWT widgets
 					// directly and would throw "Invalid thread access" from this Job.
-					monitor.subTask("Configuring view and Marketplace preferences...");
-					if (runOnUiThread(WorkspaceSetup::applyDisableViewPagination)) {
-						summary.add("Disabled the \"show remaining items\" limit in tree/table views.");
-					}
-					if (runOnUiThread(WorkspaceSetup::applyDisableMarketplaceSolutions)) {
-						summary.add("Disabled the Marketplace solution popup for missing project natures.");
+					if (steps.contains(Step.UI_PREFS)) {
+						monitor.subTask("Configuring view and Marketplace preferences...");
+						if (runOnUiThread(WorkspaceSetup::applyDisableViewPagination)) {
+							summary.add("Disabled the \"show remaining items\" limit in tree/table views.");
+						}
+						if (runOnUiThread(WorkspaceSetup::applyDisableMarketplaceSolutions)) {
+							summary.add("Disabled the Marketplace solution popup for missing project natures.");
+						}
 					}
 					monitor.worked(WORK_PREFS);
 
-					boolean freshWorkspace = ResourcesPlugin.getWorkspace().getRoot().getProjects().length == 0;
-					if (freshWorkspace) {
+					if (steps.contains(Step.IMPORT_PROJECTS)) {
 						importAndOrganize(repoRoot, summary, monitor);
 					}
 
 					monitor.subTask("Configuring license header and save actions...");
-					if (applyLicenseHeader()) {
+					if (steps.contains(Step.LICENSE_HEADER) && applyLicenseHeader()) {
 						summary.add("License header template configured.");
 					}
-					if (applySaveActions()) {
+					if (steps.contains(Step.SAVE_ACTIONS) && applySaveActions()) {
 						summary.add("Organize imports + format on save configured.");
 					}
 					monitor.worked(WORK_LICENSE_SAVE);
 
-					monitor.subTask("Configuring JDK...");
-					applyJdk(summary);
+					if (steps.contains(Step.JDK)) {
+						monitor.subTask("Configuring JDK...");
+						applyJdk(summary);
+					}
 					monitor.worked(WORK_JDK);
 
-					monitor.subTask("Syncing target platform from POM...");
-					applyPomSync(summary);
+					if (steps.contains(Step.POM_SYNC)) {
+						monitor.subTask("Syncing target platform from POM...");
+						applyPomSync(summary);
+					}
 					monitor.worked(WORK_POM_SYNC);
 
-					if (freshWorkspace) {
+					if (steps.contains(Step.DOCTOR)) {
 						applyDoctorRepair(summary, monitor);
-						monitor.worked(WORK_DOCTOR);
 					}
+					monitor.worked(WORK_DOCTOR);
 
 					Activator.getDefault().getPreferenceStore().setValue(Activator.PREF_WORKSPACE_SETUP_DONE, true);
 					LOG.info("Workspace setup done for " + repoRoot + ": "
@@ -258,11 +300,13 @@ public class WorkspaceSetup {
 	}
 
 	/**
-	 * Imports and organizes projects on a workspace that has none yet — the
-	 * bootstrap case. Runs unattended: the workspace-mutation consent (Window >
-	 * Preferences > BlueMind) would otherwise pop up a dialog for a background
-	 * job nobody is watching, so a still-default "ask" is elevated to "always"
-	 * for the duration of this call only; an explicit "never" is left as is.
+	 * Imports and organizes projects — the bootstrap case, but also re-runnable
+	 * on demand (e.g. after a repo pull added projects) via the step's checkbox
+	 * in the manual dialog. Runs unattended: the workspace-mutation consent
+	 * (Window > Preferences > BlueMind) would otherwise pop up a dialog for a
+	 * background job nobody is watching, so a still-default "ask" is elevated to
+	 * "always" for the duration of this call only; an explicit "never" is left
+	 * as is.
 	 */
 	/** Ticks for the two sub-steps below, out of {@link #WORK_IMPORT}. */
 	private static final int WORK_IMPORT_PROJECTS = 40;
