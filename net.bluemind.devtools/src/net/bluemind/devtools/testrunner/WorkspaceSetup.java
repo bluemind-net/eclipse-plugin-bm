@@ -615,7 +615,7 @@ public class WorkspaceSetup {
 
 	private static void applyDoctorRepair(StringJoiner summary, IProgressMonitor monitor) {
 		if (!Activator.getDefault().getPreferenceStore().getBoolean(Activator.PREF_MCP_ENABLED)) {
-			summary.add("Doctor repair skipped — MCP server disabled (BlueMind preferences).");
+			warnDoctorProblem(summary, "Doctor repair skipped — MCP server disabled (BlueMind preferences).");
 			return;
 		}
 		monitor.subTask("Waiting for pending background jobs before running bm-eclipse-doctor...");
@@ -632,12 +632,12 @@ public class WorkspaceSetup {
 
 		File script = resolveScript("bm-eclipse-doctor");
 		if (script == null) {
-			summary.add("Doctor repair skipped — bm-eclipse-doctor not found in the plugin bundle.");
+			warnDoctorProblem(summary, "Doctor repair skipped — bm-eclipse-doctor not found in the plugin bundle.");
 			return;
 		}
 		Path config = BmMcpConfigFile.configPath();
 		if (!Files.isReadable(config)) {
-			summary.add("Doctor repair skipped — no MCP config written yet.");
+			warnDoctorProblem(summary, "Doctor repair skipped — no MCP config written yet.");
 			return;
 		}
 
@@ -653,14 +653,34 @@ public class WorkspaceSetup {
 			if (endLine.find()) {
 				summary.add("Doctor repair: " + endLine.group());
 			} else {
-				summary.add("Doctor repair " + (rc == 0 ? "done" : "exited " + rc)
-						+ " — see the error log for bm-eclipse-doctor's output.");
+				String message = "Doctor repair " + (rc == 0 ? "done" : "exited " + rc)
+						+ " — see the error log for bm-eclipse-doctor's output.";
+				if (rc == 0) {
+					summary.add(message);
+				} else {
+					warnDoctorProblem(summary, message);
+				}
 			}
 		} catch (IOException e) {
-			summary.add("Doctor repair skipped — could not run python3: " + e.getMessage());
+			warnDoctorProblem(summary, "Doctor repair skipped — could not run python3: " + e.getMessage());
 		} catch (InterruptedException e) {
 			Thread.currentThread().interrupt();
 		}
+	}
+
+	/**
+	 * Same immediate-warning pattern as the missing-JDK case in {@link #applyJdk}:
+	 * these doctor failure modes are easy to miss buried as a single line in the
+	 * final "everything's fine" summary dialog, so they also get their own popup.
+	 */
+	private static void warnDoctorProblem(StringJoiner summary, String message) {
+		summary.add(message);
+		Display.getDefault().asyncExec(() -> {
+			Shell shell = activeShell();
+			if (shell != null) {
+				MessageDialog.openWarning(shell, "BlueMind Workspace Setup", message);
+			}
+		});
 	}
 
 	/**

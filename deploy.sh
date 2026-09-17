@@ -69,6 +69,10 @@ find "$SRC" -name '*.java' > "$BUILD_DIR/srcs.txt"
 javac --release 21 -encoding UTF-8 -cp "$CP" -d "$OUT" "@$BUILD_DIR/srcs.txt"
 
 cp -r "$PLUGIN_DIR/icons" "$OUT/"
+# scripts/ is a symlink to ../.claude/scripts — dereference it so the real
+# files land in $OUT (a plain -r would copy the symlink itself, pointing
+# nowhere once it's no longer next to .claude/).
+cp -rL "$PLUGIN_DIR/scripts" "$OUT/"
 cp "$PLUGIN_DIR/plugin.xml" "$OUT/"
 
 MANIFEST="$BUILD_DIR/MANIFEST.MF"
