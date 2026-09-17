@@ -23,7 +23,7 @@ public class PomPropertyReader {
 	private static volatile Path cachedPomPath;
 
 	public record PomProperties(String dockerDevenvTag, String targetPlatformVersion,
-			String targetRepoUrl, String resolvedTestArgLine) {
+			String targetRepoUrl, String resolvedTestArgLine, String requiredJavaVersion) {
 
 		public boolean isFileTarget() {
 			return targetRepoUrl != null && targetRepoUrl.startsWith("file:");
@@ -49,15 +49,10 @@ public class PomPropertyReader {
 				continue;
 			}
 
-			Path current = Path.of(location.toOSString());
-			while (current != null) {
-				Path candidate = current.resolve("global/pom.xml");
-				if (Files.exists(candidate)) {
-					cachedPomPath = candidate;
-					LOG.info("Found BlueMind global POM: " + candidate);
-					return Optional.of(candidate);
-				}
-				current = current.getParent();
+			Optional<Path> found = walkUpForGlobalPom(Path.of(location.toOSString()));
+			if (found.isPresent()) {
+				cachedPomPath = found.get();
+				return found;
 			}
 		}
 
@@ -71,6 +66,54 @@ public class PomPropertyReader {
 	 */
 	public static Optional<Path> findRepoRoot() {
 		return findGlobalPom().map(pom -> pom.getParent().getParent().getParent());
+	}
+
+	/**
+	 * Fallback for a brand-new workspace with no project imported yet: walks up
+	 * from the Eclipse workspace location itself. Only useful when the workspace
+	 * (Eclipse {@code -data}) is created inside the BlueMind repo worktree.
+	 */
+	public static Optional<Path> findRepoRootFromWorkspaceLocation() {
+		var location = ResourcesPlugin.getWorkspace().getRoot().getLocation();
+		if (location == null) {
+			return Optional.empty();
+		}
+		Optional<Path> found = walkUpForGlobalPom(Path.of(location.toOSString()));
+		found.ifPresent(pom -> cachedPomPath = pom);
+		return found.map(pom -> pom.getParent().getParent().getParent());
+	}
+
+	/**
+	 * Same lookup as {@link #findRepoRoot()}, but starting from an arbitrary
+	 * user-picked directory instead of a workspace project location — used by
+	 * the "Setup Eclipse Workspace..." folder browser to validate a manual pick.
+	 */
+	public static Optional<Path> findRepoRootFrom(Path start) {
+		Optional<Path> found = walkUpForGlobalPom(start);
+		found.ifPresent(pom -> cachedPomPath = pom);
+		return found.map(pom -> pom.getParent().getParent().getParent());
+	}
+
+	/**
+	 * Walks up from {@code start} looking for {@code global/pom.xml} as a direct
+	 * child (matches a starting point already inside {@code open/}, e.g. a
+	 * project location) or as a child of {@code open/} (matches a starting point
+	 * at or above the repo root, e.g. the Eclipse workspace location itself when
+	 * it's created next to — rather than inside — {@code open/}).
+	 */
+	private static Optional<Path> walkUpForGlobalPom(Path start) {
+		Path current = start;
+		while (current != null) {
+			for (Path candidate : new Path[] { current.resolve("global/pom.xml"),
+					current.resolve("open/global/pom.xml") }) {
+				if (Files.exists(candidate)) {
+					LOG.info("Found BlueMind global POM: " + candidate);
+					return Optional.of(candidate);
+				}
+			}
+			current = current.getParent();
+		}
+		return Optional.empty();
 	}
 
 	/**
@@ -109,7 +152,8 @@ public class PomPropertyReader {
 			if (!localOpts.isEmpty()) {
 				resolved = resolved + " " + localOpts;
 			}
-			return Optional.of(new PomProperties(dockerTag, targetVersion, targetRepoUrl, resolved));
+			String requiredJavaVersion = findCompilerTargetVersion(doc);
+			return Optional.of(new PomProperties(dockerTag, targetVersion, targetRepoUrl, resolved, requiredJavaVersion));
 		} catch (Exception e) {
 			LOG.error("Failed to parse POM: " + pomPath, e);
 			return Optional.empty();
@@ -126,6 +170,38 @@ public class PomPropertyReader {
 			String layout = getChildText(repo, "layout");
 			if ("bluemind-deps".equals(id) && "p2".equals(layout)) {
 				return getChildText(repo, "url");
+			}
+		}
+		return null;
+	}
+
+	/**
+	 * Finds the {@code <target>} (falling back to {@code <source>}) release version
+	 * configured on the {@code maven-compiler-plugin}, wherever it's declared
+	 * ({@code build}, {@code pluginManagement}, or a profile).
+	 */
+	private static String findCompilerTargetVersion(Document doc) {
+		NodeList plugins = doc.getElementsByTagName("plugin");
+		for (int i = 0; i < plugins.getLength(); i++) {
+			if (!(plugins.item(i) instanceof Element plugin)) {
+				continue;
+			}
+			if (!"maven-compiler-plugin".equals(getChildText(plugin, "artifactId"))) {
+				continue;
+			}
+			NodeList configs = plugin.getElementsByTagName("configuration");
+			for (int c = 0; c < configs.getLength(); c++) {
+				if (!(configs.item(c) instanceof Element config)) {
+					continue;
+				}
+				String target = getChildText(config, "target");
+				if (target != null) {
+					return target;
+				}
+				String source = getChildText(config, "source");
+				if (source != null) {
+					return source;
+				}
 			}
 		}
 		return null;

@@ -13,4 +13,27 @@
     <artifactId>net.bluemind.devtools</artifactId>
     <packaging>eclipse-plugin</packaging>
     <name>BlueMind Developer Tools :: Plugin</name>
+
+    <build>
+        <plugins>
+            <!-- scripts/ is a symlink to ../.claude/scripts so both the IDE (self-hosted
+                 runtime) and the packaged bundle read the same files. Tycho's own file
+                 scan does not follow symlinks, so point it at the real directory instead. -->
+            <plugin>
+                <groupId>org.eclipse.tycho</groupId>
+                <artifactId>tycho-packaging-plugin</artifactId>
+                <configuration>
+                    <additionalFileSets>
+                        <fileSet>
+                            <prefix>scripts/</prefix>
+                            <directory>${project.basedir}/../.claude/scripts</directory>
+                            <excludes>
+                                <exclude>**/__pycache__/**</exclude>
+                            </excludes>
+                        </fileSet>
+                    </additionalFileSets>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
 </project>

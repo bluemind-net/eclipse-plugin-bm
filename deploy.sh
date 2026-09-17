@@ -28,10 +28,37 @@ ECLIPSE_PLUGINS="$ECLIPSE/plugins"
 SRC="$PLUGIN_DIR/src"
 BUILD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/bm-devtools-build.XXXXXX")"
 OUT="$BUILD_DIR/bin"
-OUT_JAR="$ECLIPSE/dropins/net.bluemind.devtools_1.6.0.jar"
 trap 'rm -rf "$BUILD_DIR"' EXIT
 
 mkdir -p "$OUT" "$ECLIPSE/dropins"
+
+# The bundle is a singleton: OSGi picks whichever installed copy has the
+# highest Bundle-Version, silently ignoring the rest. A stale copy from a
+# real Tycho/p2 install can therefore outrank this script's own dropins jar
+# if its qualifier happens to sort higher — so any existing copy, wherever it
+# lives (plugins/ from a Tycho install, dropins/ from a previous run of this
+# script), is removed first to guarantee only this build is ever picked up.
+BUNDLE_VERSION="$(sed -n 's/^Bundle-Version: *\(.*\)$/\1/p' "$PLUGIN_DIR/META-INF/MANIFEST.MF")"
+QUALIFIER="$(date +%Y%m%d%H%M%S)"
+RESOLVED_VERSION="${BUNDLE_VERSION%.qualifier}.$QUALIFIER"
+OUT_JAR="$ECLIPSE/dropins/net.bluemind.devtools_${RESOLVED_VERSION}.jar"
+
+echo "Removing existing net.bluemind.devtools bundles..."
+find "$ECLIPSE/plugins" "$ECLIPSE/dropins" -maxdepth 1 -name 'net.bluemind.devtools_*.jar' -print -delete
+
+# A jar removed from plugins/ (as opposed to dropins/, which is scanned fresh
+# every launch) can still be referenced by simpleconfigurator's bundles.info —
+# the p2-managed "installed bundles" list — if this was originally installed
+# via a real Tycho/p2 install (e.g. `ape -u`/`bm-cli setup upgrade`). Left
+# dangling, simpleconfigurator tries to load a file that no longer exists and
+# the whole bundle fails to activate — no error dialog, just a silently
+# missing "BlueMind" menu and MCP server. Strip it so only the dropins copy
+# this script just wrote provides the bundle.
+BUNDLES_INFO="$ECLIPSE/configuration/org.eclipse.equinox.simpleconfigurator/bundles.info"
+if [ -f "$BUNDLES_INFO" ] && grep -q '^net\.bluemind\.devtools,' "$BUNDLES_INFO"; then
+	echo "Removing net.bluemind.devtools from simpleconfigurator's bundles.info..."
+	sed -i '/^net\.bluemind\.devtools,/d' "$BUNDLES_INFO"
+fi
 
 # Classpath = every (non-source) jar shipped with this Eclipse.
 CP="$(find "$ECLIPSE_PLUGINS" -name '*.jar' ! -name '*.source_*' | tr '\n' ':')"
@@ -42,10 +69,17 @@ find "$SRC" -name '*.java' > "$BUILD_DIR/srcs.txt"
 javac --release 21 -encoding UTF-8 -cp "$CP" -d "$OUT" "@$BUILD_DIR/srcs.txt"
 
 cp -r "$PLUGIN_DIR/icons" "$OUT/"
+# scripts/ is a symlink to ../.claude/scripts — dereference it so the real
+# files land in $OUT (a plain -r would copy the symlink itself, pointing
+# nowhere once it's no longer next to .claude/).
+cp -rL "$PLUGIN_DIR/scripts" "$OUT/"
 cp "$PLUGIN_DIR/plugin.xml" "$OUT/"
 
-echo "Packaging -> $OUT_JAR"
-jar cfm "$OUT_JAR" "$PLUGIN_DIR/META-INF/MANIFEST.MF" -C "$OUT" .
+MANIFEST="$BUILD_DIR/MANIFEST.MF"
+sed "s/^Bundle-Version: .*/Bundle-Version: $RESOLVED_VERSION/" "$PLUGIN_DIR/META-INF/MANIFEST.MF" > "$MANIFEST"
+
+echo "Packaging -> $OUT_JAR (version $RESOLVED_VERSION)"
+jar cfm "$OUT_JAR" "$MANIFEST" -C "$OUT" .
 
 echo "Clearing OSGi cache..."
 rm -rf "$ECLIPSE/configuration/org.eclipse.osgi"
