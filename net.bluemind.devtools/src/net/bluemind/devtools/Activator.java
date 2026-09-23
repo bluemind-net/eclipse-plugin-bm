@@ -10,6 +10,7 @@ import net.bluemind.devtools.icr.model.IcrSessionStore;
 import net.bluemind.devtools.icr.ui.IcrEditors;
 import net.bluemind.devtools.testrunner.BmContext;
 import net.bluemind.devtools.testrunner.PomFileWatcher;
+import net.bluemind.devtools.testrunner.WorkspaceSetup;
 import net.bluemind.devtools.testrunner.mcp.BmMcpConfigFile;
 import net.bluemind.devtools.testrunner.mcp.BmMcpServer;
 import net.bluemind.devtools.testrunner.mcp.BmMcpTools;
@@ -34,6 +35,10 @@ public class Activator extends AbstractUIPlugin {
 	 * workspace with auto-build silently off.
 	 */
 	public static final String PREF_AUTOBUILD_SAVED = "workspace.autobuild.saved";
+	/** Set once the one-time workspace setup (license header, save actions, JDK) has run. */
+	public static final String PREF_WORKSPACE_SETUP_DONE = "workspace.setup.done";
+	/** Last repo root picked in the "Setup Eclipse Workspace..." folder browser, preselected next time. */
+	public static final String PREF_LAST_REPO_ROOT = "workspace.setup.lastRepoRoot";
 
 	/** Status icons used by the Branch Changed Files view, preloaded into the image registry. */
 	private static final String[] STATUS_ICONS = { "modified", "added", "deleted", "renamed", "copied" };
@@ -67,6 +72,8 @@ public class Activator extends AbstractUIPlugin {
 		getPreferenceStore().setDefault(PREF_CONSENT_WORKINGSETS, "ask");
 		getPreferenceStore().setDefault(PREF_WORKINGSETS_MANAGED, "");
 		getPreferenceStore().setDefault(PREF_AUTOBUILD_SAVED, "");
+		getPreferenceStore().setDefault(PREF_WORKSPACE_SETUP_DONE, false);
+		getPreferenceStore().setDefault(PREF_LAST_REPO_ROOT, "");
 
 		// Recover from a batch that suspended auto-build and never restored it
 		// (e.g. a hard crash between suspend and the finally block last session).
@@ -75,6 +82,8 @@ public class Activator extends AbstractUIPlugin {
 		if (isPomWatchEnabled() && BmContext.instance().hasGlobalPom()) {
 			PomFileWatcher.instance().start();
 		}
+
+		WorkspaceSetup.runIfNeeded();
 
 		if (getPreferenceStore().getBoolean(PREF_MCP_ENABLED)) {
 			startMcpServer();
