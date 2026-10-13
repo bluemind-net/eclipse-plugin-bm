@@ -10,6 +10,7 @@ import java.util.Arrays;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.eclipse.core.runtime.CoreException;
@@ -359,15 +360,20 @@ public class PomSyncChecker {
 			@Override
 			public void done(IJobChangeEvent event) {
 				var result = event.getResult();
-				if (!result.isOK() && !result.matches(IStatus.CANCEL)) {
-					Display.getDefault().asyncExec(() -> {
-						Shell shell = getShell();
-						if (shell != null) {
-							MessageDialog.openError(shell, "BlueMind Target Platform",
-									"Failed to load target platform:\n" + result.getMessage());
-						}
-					});
+				if (result.matches(IStatus.CANCEL)) {
+					return;
 				}
+				// The job itself reports OK when the target merely failed to resolve: PDE
+				// only logs that, so the target's own status is what tells.
+				Optional<String> problem = result.isOK() ? TargetPlatformHealth.describeProblem(target)
+						: Optional.of(result.getMessage());
+				problem.ifPresent(text -> Display.getDefault().asyncExec(() -> {
+					Shell shell = getShell();
+					if (shell != null) {
+						MessageDialog.openError(shell, "BlueMind Target Platform",
+								"Failed to load target platform:\n\n" + text);
+					}
+				}));
 			}
 		});
 		loadJob.setUser(true);
