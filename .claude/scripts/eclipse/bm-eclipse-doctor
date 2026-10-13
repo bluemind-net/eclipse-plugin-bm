@@ -22,6 +22,10 @@ Classification is by FACT, not by symptom or by message shape:
   unresolved type nowhere, in generated sources, untracked                 -> delete + clean
   none of the above                                                        -> real code error, hand off
 
+A target platform that failed to resolve (`targetPlatformProblem` in the snapshot) stops
+the run before any classification: every bundle it should provide is missing, so the
+errors are its fallout, and no remedy here can fix a target that does not resolve.
+
 The three type-level facts come from the plugin (`unresolvedTypes`), which asks the JDT
 model and the disk; the script never parses a message to get a missing name — markers
 carry `problemKind` and `unresolvedName` as structured attributes.
@@ -2259,6 +2263,15 @@ def main():
     if args.json:
         print(json.dumps(snap.raw, indent=2))
         return 0
+
+    target_problem = snap.raw.get("targetPlatformProblem")
+    if target_problem:
+        print("\nThe target platform failed to resolve — nothing to diagnose or repair until it does:\n")
+        print(target_problem)
+        print("\nFix it, reload it (reload_target_platform), then run the doctor again.")
+        emit("end", passes=0, errors_before=snap.error_count, errors_after=snap.error_count,
+             handoff_projects=0, handoff_errors=0, decided_errors=0, aborted="target-platform")
+        return 2
 
     plan = None
     if snap.error_count == 0:

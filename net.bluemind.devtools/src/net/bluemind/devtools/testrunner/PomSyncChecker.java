@@ -53,6 +53,13 @@ public class PomSyncChecker {
 	private static final int INCLUDE_SOURCE = 1 << 2;
 	private static final int INCLUDE_CONFIGURE_PHASE = 1 << 3;
 
+	/**
+	 * Family of the jobs below, which only schedule PDE's own
+	 * LoadTargetDefinitionJob once their (slow) repository query is done: a
+	 * caller waiting for the target to be loaded must join this family first.
+	 */
+	static final String TARGET_SYNC_JOB_FAMILY = "net.bluemind.devtools.targetSync";
+
 	public record SyncStatus(
 			boolean vmArgsMismatch,
 			boolean targetPlatformMismatch,
@@ -247,6 +254,11 @@ public class PomSyncChecker {
 	private static void applyHttpTargetSync(String repoUrl, BmLocationInfo currentBmLocation) {
 		new Job("Updating BlueMind target platform") {
 			@Override
+			public boolean belongsTo(Object family) {
+				return TARGET_SYNC_JOB_FAMILY.equals(family);
+			}
+
+			@Override
 			protected IStatus run(IProgressMonitor monitor) {
 				try {
 					monitor.beginTask("Fetching P2 repository metadata", IProgressMonitor.UNKNOWN);
@@ -305,6 +317,11 @@ public class PomSyncChecker {
 		}
 
 		new Job("Updating BlueMind target platform (local directory)") {
+			@Override
+			public boolean belongsTo(Object family) {
+				return TARGET_SYNC_JOB_FAMILY.equals(family);
+			}
+
 			@Override
 			protected IStatus run(IProgressMonitor monitor) {
 				try {

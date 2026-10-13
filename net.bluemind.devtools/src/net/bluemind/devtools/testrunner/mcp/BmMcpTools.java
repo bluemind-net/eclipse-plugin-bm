@@ -396,8 +396,9 @@ public final class BmMcpTools {
 								+ " distinct name an error marker cannot resolve, located as jdt-visible /"
 								+ " disk-only / closed-provider / nowhere — see locate_type) and"
 								+ " 'settled'/'settleRounds', which"
-								+ " say whether the workspace was actually quiet when the markers were read."
-								+ " Pure facts, no verdict.",
+								+ " say whether the workspace was actually quiet when the markers were read,"
+								+ " and 'targetPlatformProblem' (null unless the target platform failed to"
+								+ " resolve). Pure facts, no verdict.",
 						Map.of(
 								"severity", paramSeverity(),
 								"waitForBuild", paramBoolean(
@@ -2605,9 +2606,13 @@ public final class BmMcpTools {
 		}
 
 		UnresolvedTypes types = unresolvedTypes(problems.markers(), root);
+		String targetProblem = TargetPlatformHealth.describeWorkspaceTargetProblem().orElse(null);
 
 		StringBuilder sb = new StringBuilder();
 		sb.append("# Doctor snapshot\n\n");
+		if (targetProblem != null) {
+			sb.append("Target platform: FAILED to resolve\n");
+		}
 		sb.append("Branch: ").append(workspace.get("branch")).append(" | Plugin: ")
 				.append(workspace.get("pluginVersion")).append("\n");
 		sb.append("Projects: ").append(workspace.get("openProjects")).append(" open, ")
@@ -2632,6 +2637,7 @@ public final class BmMcpTools {
 		json.put("unknownBundles", unknown);
 		json.put("unresolvedTypes", types.entries());
 		json.put("unresolvedTypesTruncated", types.truncated());
+		json.put("targetPlatformProblem", targetProblem);
 		appendJsonBlock(sb, json);
 		return new ToolResult(true, sb.toString());
 	}
