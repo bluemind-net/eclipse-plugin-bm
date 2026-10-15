@@ -72,6 +72,7 @@ import org.osgi.framework.ServiceReference;
 import net.bluemind.devtools.Activator;
 import net.bluemind.devtools.testrunner.PomPropertyReader;
 import net.bluemind.devtools.testrunner.PomSyncChecker;
+import net.bluemind.devtools.testrunner.TargetPlatformHealth;
 
 public final class BmMcpTools {
 
@@ -266,7 +267,9 @@ public final class BmMcpTools {
 				toolDescriptor(TOOL_RELOAD_TARGET,
 						"Reload and re-resolve the active workspace target platform (equivalent of the"
 								+ " 'Reload Target Platform' button). Use after the target definition or its"
-								+ " p2 repository changed. Takes no arguments.",
+								+ " p2 repository changed. Takes no arguments. FAILED when the target does not"
+								+ " resolve, with PDE's error and, when found, the stale local bundle pool"
+								+ " entries that cause it.",
 						Map.of(),
 						List.of()),
 				toolDescriptor(TOOL_IMPORT_PROJECTS,
@@ -393,8 +396,9 @@ public final class BmMcpTools {
 								+ " distinct name an error marker cannot resolve, located as jdt-visible /"
 								+ " disk-only / closed-provider / nowhere — see locate_type) and"
 								+ " 'settled'/'settleRounds', which"
-								+ " say whether the workspace was actually quiet when the markers were read."
-								+ " Pure facts, no verdict.",
+								+ " say whether the workspace was actually quiet when the markers were read,"
+								+ " and 'targetPlatformProblem' (null unless the target platform failed to"
+								+ " resolve). Pure facts, no verdict.",
 						Map.of(
 								"severity", paramSeverity(),
 								"waitForBuild", paramBoolean(
@@ -1114,14 +1118,18 @@ public final class BmMcpTools {
 			job.schedule();
 			job.join();
 			IStatus result = job.getResult();
-			boolean ok = result == null || result.isOK();
+			boolean jobOk = result == null || result.isOK();
+			// The job reports OK even when the target failed to resolve.
+			Optional<String> problem = jobOk ? TargetPlatformHealth.describeProblem(target) : Optional.empty();
+			boolean ok = jobOk && problem.isEmpty();
 			String name = target.getName() == null ? "(unnamed)" : target.getName();
 			StringBuilder sb = new StringBuilder();
 			sb.append("# Reload target platform — ").append(ok ? "OK" : "FAILED").append("\n\n");
 			sb.append("Target: ").append(name).append("\n");
-			if (!ok) {
+			if (!jobOk) {
 				sb.append("Status: ").append(result.getMessage()).append("\n");
 			}
+			problem.ifPresent(text -> sb.append("\n").append(text).append("\n"));
 			return new ToolResult(ok, sb.toString());
 		} catch (InterruptedException e) {
 			Thread.currentThread().interrupt();
@@ -2598,9 +2606,13 @@ public final class BmMcpTools {
 		}
 
 		UnresolvedTypes types = unresolvedTypes(problems.markers(), root);
+		String targetProblem = TargetPlatformHealth.describeWorkspaceTargetProblem().orElse(null);
 
 		StringBuilder sb = new StringBuilder();
 		sb.append("# Doctor snapshot\n\n");
+		if (targetProblem != null) {
+			sb.append("Target platform: FAILED to resolve\n");
+		}
 		sb.append("Branch: ").append(workspace.get("branch")).append(" | Plugin: ")
 				.append(workspace.get("pluginVersion")).append("\n");
 		sb.append("Projects: ").append(workspace.get("openProjects")).append(" open, ")
@@ -2625,6 +2637,7 @@ public final class BmMcpTools {
 		json.put("unknownBundles", unknown);
 		json.put("unresolvedTypes", types.entries());
 		json.put("unresolvedTypesTruncated", types.truncated());
+		json.put("targetPlatformProblem", targetProblem);
 		appendJsonBlock(sb, json);
 		return new ToolResult(true, sb.toString());
 	}

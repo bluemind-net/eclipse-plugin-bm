@@ -603,13 +603,20 @@ public class WorkspaceSetup {
 	 *
 	 * <p>
 	 * {@link #applyPomSync} above only *schedules* the target platform reload
-	 * (asynchronously) — this waits for the build and target-platform-resolution
-	 * jobs first, so the doctor's facts are read against a resolved target
-	 * platform, not an empty one. Deliberately joins those specific families
-	 * rather than {@code null} ("every job"): this method runs on the setup
-	 * job's own worker thread, and {@code null} matches every job regardless of
-	 * its {@code belongsTo()} — including the still-{@code RUNNING} setup job
-	 * itself, which self-deadlocks since it can't finish until join() returns.
+	 * (asynchronously, behind a p2 repository query) — this waits for that, then
+	 * for the target-platform-resolution and build jobs, so the doctor's facts
+	 * are read against a resolved target platform, not an empty one. Deliberately
+	 * joins those specific families rather than {@code null} ("every job"): this
+	 * method runs on the setup job's own worker thread, and {@code null} matches
+	 * every job regardless of its {@code belongsTo()} — including the
+	 * still-{@code RUNNING} setup job itself, which self-deadlocks since it can't
+	 * finish until join() returns.
+	 *
+	 * <p>
+	 * A target platform that failed to resolve skips the doctor altogether: every
+	 * bundle it should provide is then missing, the error count balloons, and the
+	 * doctor would spend its passes "repairing" projects that only a working
+	 * target platform can fix.
 	 */
 	private static final String PDE_TARGET_JOB_FAMILY = "LoadTargetDefinitionJob";
 
@@ -620,13 +627,22 @@ public class WorkspaceSetup {
 		}
 		monitor.subTask("Waiting for pending background jobs before running bm-eclipse-doctor...");
 		try {
+			Job.getJobManager().join(PomSyncChecker.TARGET_SYNC_JOB_FAMILY, new NullProgressMonitor());
+			Job.getJobManager().join(PDE_TARGET_JOB_FAMILY, new NullProgressMonitor());
 			Job.getJobManager().join(ResourcesPlugin.FAMILY_AUTO_BUILD, new NullProgressMonitor());
 			Job.getJobManager().join(ResourcesPlugin.FAMILY_MANUAL_BUILD, new NullProgressMonitor());
-			Job.getJobManager().join(PDE_TARGET_JOB_FAMILY, new NullProgressMonitor());
 		} catch (OperationCanceledException e) {
 			return;
 		} catch (InterruptedException e) {
 			Thread.currentThread().interrupt();
+			return;
+		}
+
+		Optional<String> targetProblem = TargetPlatformHealth.describeWorkspaceTargetProblem();
+		if (targetProblem.isPresent()) {
+			warnDoctorProblem(summary, "Doctor repair skipped — the target platform failed to resolve. Fix it, reload"
+					+ " it (Window > Preferences > Plug-in Development > Target Platform > Reload), then run"
+					+ " bm-eclipse-doctor.\n\n" + targetProblem.get());
 			return;
 		}
 

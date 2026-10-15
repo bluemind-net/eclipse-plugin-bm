@@ -154,6 +154,12 @@ obsolète et ne touche jamais aux working sets — c'est `--sync` qui fait ça.
 | Marqueur sur le **projet lui-même** (pas un fichier), sans `problemKind` ni `unresolvedName`, bundle `resolved: true` | fait `build-order-stale`, `clean` du projet |
 | Aucun des précédents | vraie erreur de code → hand-off, on ne touche pas |
 
+**Target platform en échec** (`targetPlatformProblem` non nul dans `doctor_snapshot`) : le doctor
+s'arrête avant toute classification (`[doctor:end] … aborted=target-platform`, code retour 2) et
+affiche l'erreur PDE, plus, s'il en trouve, les entrées périmées des bundle pools locaux qui la
+causent. Les erreurs ne sont alors que la conséquence de la target : la réparer, `reload_target_platform`,
+puis relancer. Le setup automatique du workspace ne lance pas le doctor dans ce cas.
+
 `clean` n'est jamais tenté sur un projet dont le modèle PDE n'a ni `source=` ni `resolved=` — pas de
 modèle, pas de `clean` à faire porter. Un couple (fait, remède, cible) déjà sorti `no-effect` dans ce
 run n'est **jamais** redécidé une deuxième fois (mémoire valable pour la durée du run, jamais rejouée

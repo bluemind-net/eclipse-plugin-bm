@@ -10,6 +10,7 @@ import java.util.Arrays;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.eclipse.core.runtime.CoreException;
@@ -51,6 +52,13 @@ public class PomSyncChecker {
 	private static final int INCLUDE_REQUIRED = 1 << 0;
 	private static final int INCLUDE_SOURCE = 1 << 2;
 	private static final int INCLUDE_CONFIGURE_PHASE = 1 << 3;
+
+	/**
+	 * Family of the jobs below, which only schedule PDE's own
+	 * LoadTargetDefinitionJob once their (slow) repository query is done: a
+	 * caller waiting for the target to be loaded must join this family first.
+	 */
+	static final String TARGET_SYNC_JOB_FAMILY = "net.bluemind.devtools.targetSync";
 
 	public record SyncStatus(
 			boolean vmArgsMismatch,
@@ -246,6 +254,11 @@ public class PomSyncChecker {
 	private static void applyHttpTargetSync(String repoUrl, BmLocationInfo currentBmLocation) {
 		new Job("Updating BlueMind target platform") {
 			@Override
+			public boolean belongsTo(Object family) {
+				return TARGET_SYNC_JOB_FAMILY.equals(family);
+			}
+
+			@Override
 			protected IStatus run(IProgressMonitor monitor) {
 				try {
 					monitor.beginTask("Fetching P2 repository metadata", IProgressMonitor.UNKNOWN);
@@ -305,6 +318,11 @@ public class PomSyncChecker {
 
 		new Job("Updating BlueMind target platform (local directory)") {
 			@Override
+			public boolean belongsTo(Object family) {
+				return TARGET_SYNC_JOB_FAMILY.equals(family);
+			}
+
+			@Override
 			protected IStatus run(IProgressMonitor monitor) {
 				try {
 					monitor.beginTask("Configuring local directory target", IProgressMonitor.UNKNOWN);
@@ -359,15 +377,20 @@ public class PomSyncChecker {
 			@Override
 			public void done(IJobChangeEvent event) {
 				var result = event.getResult();
-				if (!result.isOK() && !result.matches(IStatus.CANCEL)) {
-					Display.getDefault().asyncExec(() -> {
-						Shell shell = getShell();
-						if (shell != null) {
-							MessageDialog.openError(shell, "BlueMind Target Platform",
-									"Failed to load target platform:\n" + result.getMessage());
-						}
-					});
+				if (result.matches(IStatus.CANCEL)) {
+					return;
 				}
+				// The job itself reports OK when the target merely failed to resolve: PDE
+				// only logs that, so the target's own status is what tells.
+				Optional<String> problem = result.isOK() ? TargetPlatformHealth.describeProblem(target)
+						: Optional.of(result.getMessage());
+				problem.ifPresent(text -> Display.getDefault().asyncExec(() -> {
+					Shell shell = getShell();
+					if (shell != null) {
+						MessageDialog.openError(shell, "BlueMind Target Platform",
+								"Failed to load target platform:\n\n" + text);
+					}
+				}));
 			}
 		});
 		loadJob.setUser(true);
